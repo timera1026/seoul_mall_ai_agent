@@ -1,0 +1,866 @@
+"""
+상권 분석 AI 챗봇 - 웹 버전 (Streamlit)
+=======================================
+실행: streamlit run streamlit_app.py
+배포: Streamlit Community Cloud (streamlit.io) 무료 호스팅
+"""
+
+import os
+import json
+import streamlit as st
+import streamlit.components.v1 as components
+import pandas as pd
+from dotenv import load_dotenv
+from anthropic import Anthropic
+
+load_dotenv()
+
+from compare_trade_area import (
+    analyze_single_area,
+    store_breakdown_to_plain_dict,
+    get_commercial_sale_prices,
+    estimate_price_per_pyeong,
+    estimate_rent,
+    get_building_info,
+    get_static_map_image,
+    summarize_estimated_sales,
+    summarize_store_stats,
+    CONFIG,
+)
+
+MODEL_NAME = "claude-sonnet-4-5"
+
+SYSTEM_PROMPT = (
+    "당신은 건설사/디벨로퍼(임대인) 내부 실무자를 돕는 상권·임대 전략 전문가입니다. "
+    "이 도구를 쓰는 사람은 상가를 소유하고 임차인을 유치해야 하는 임대인 측 담당자이며, "
+    "목표는 '어떤 임대료와 업종 구성이 임차인에게 매력적으로 보여서 공실 없이 빠르게 "
+    "채울 수 있는가'를 판단하는 것입니다. 임차인에게 직접 안내하듯 말하지 말고, "
+    "항상 임대인이 의사결정에 참고할 수 있는 내부 분석 보고서처럼 답변하세요.\n\n"
+    "도구 호출 결과를 받으면, 숫자를 나열만 하지 말고 다음을 반드시 포함해 상세히 설명하세요:\n"
+    "1) 핵심 수치 요약 (총 유동인구, 정주인구/등록인구, 주요 연령대, 피크 시간대, 업종 경쟁 상황)\n"
+    "2) 그 수치가 이 호실/상가의 임차인 유치 경쟁력에 어떤 의미인지 해석. "
+    "특히 유동인구 대비 정주인구(resident_population) 비율이 어떤지도 함께 짚어서, "
+    "이 상권이 '스쳐 지나가는 유동인구 의존형'인지 '실거주 배후수요가 탄탄한 곳'인지 판단해 설명하세요.\n"
+    "3) 업종 추천 시 절대 '업소 개수가 적어서 추천'이라는 논리만으로 말하지 마세요. "
+    "analyze_trade_area 결과의 demand_based_recommendations 배열을 반드시 활용하세요. "
+    "이 배열의 각 항목은 demand_score(연령대·시간대·정주인구 특성을 반영한 예상 수요), "
+    "supply_share(현재 그 업종의 실제 공급 비중 = 경쟁강도), gap_score(수요-공급 격차, "
+    "클수록 유망)를 담고 있습니다. 표를 만들 때 supply_share를 '현재 경쟁강도 OO%' 형태로 "
+    "반드시 함께 표시해 신뢰도를 높이세요. gap_score 상위 항목들을 근거로 업종을 추천하되, "
+    "**표는 상위 4~5개까지만** 다루고 각 근거는 한 문장 이내로 간결하게 쓰세요 (응답이 길어지면 "
+    "잘릴 수 있으므로 간결함이 중요합니다). 왜 그 업종의 수요가 이 지역에서 클 것으로 보이는지"
+    "(연령대/시간대/정주인구 특성과 연결해서) 설명하되, 이 수요 점수는 실제 매출 데이터가 아니라 "
+    "일반적 소비패턴 기반 추정치라는 점은 표 아래 한 줄로만 짧게 언급하세요.\n"
+    "4) analyze_trade_area 결과의 average_sale_price 안에 평당 평균 매매가와 "
+    "평당 월 임대료 시세(avg_monthly_rent_per_pyeong_manwon)가 있다면, 이 숫자를 반드시 "
+    "명시적으로 언급하고, 대표적인 평수(예: 10평, 20평) 기준으로 '월 임대료 약 OOO만원 수준' "
+    "처럼 구체적인 예상 총액도 계산해서 제시하세요. average_sale_price가 null이거나 데이터가 "
+    "없다면 '이 지역은 최근 매매 실거래 데이터가 부족해 시세 추정이 어렵다'고 명확히 밝히세요. "
+    "절대 임대료 관련 수치를 언급 없이 넘어가지 마세요. price_trend 배열(최근 수개월 평당 매매가 "
+    "추이)이 있으면, 그래프는 화면에 자동으로 표시되니 텍스트에서는 '최근 상승세/하락세/보합세'인지 "
+    "한두 문장으로만 짧게 해석해 주세요. 데이터가 부족한 달은 결측일 수 있다는 점도 참고하세요.\n"
+    "4-1) population_trend 배열(최근 분기별 총 유동인구 추이)이 있으면, 이 상권이 최근 뜨는 "
+    "중인지 지는 중인지를 반드시 짚어주세요. 가장 오래된 분기 대비 가장 최근 분기의 증감률을 "
+    "계산해서 '최근 O개 분기간 유동인구 OO% 증가/감소' 형태로 명시하고, 이게 임차인 유치 "
+    "경쟁력 판단에 왜 중요한지(예: 유동인구가 꾸준히 느는 지역은 향후 임대료 인상 여력이 있고, "
+    "줄고 있다면 공실 리스크 신호일 수 있음) 한두 문장으로 짧게 해석하세요. 그래프는 화면에 "
+    "자동 표시되니 텍스트에서는 해석만 간결하게 하세요. 분기가 2개 미만이면 추세를 논하지 말고 "
+    "'추세 판단에 충분한 분기 데이터가 없다'고만 밝히세요.\n"
+    "5) estimate_shop_rent 결과가 있다면, 그 임대료 수준이 임차인 입장에서 왜 합리적/매력적인지, "
+    "그리고 임대인 입장에서는 이 가격으로 얼마나 빨리 임차인을 유치할 수 있을지 함께 설명\n"
+    "5-1) analyze_trade_area 결과의 estimated_sales_summary, 또는 estimate_shop_rent 결과의 "
+    "예상_매출 필드가 있으면 반드시 활용하세요. 이건 카드매출 데이터 기반 '이 업종이 이 상권에서 "
+    "실제로 올리는 추정 매출'입니다(demand_score 같은 휴리스틱 추정치와는 다른, 실측에 가까운 "
+    "데이터). estimate_shop_rent의 예상_매출.임대료_매출_비율_퍼센트가 있으면 '월 매출 대비 "
+    "임대료 비중 OO%' 형태로 명시하고, 일반적으로 임대료가 매출의 10~15%를 넘으면 임차인에게 "
+    "부담스러운 수준이라는 점을 참고해 이 임대료가 임차인에게 감당 가능한 수준인지 판단해주세요. "
+    "estimated_sales_summary만 있는 경우(특정 업종을 안 정했을 때)는 매출_상위5_업종을 통해 "
+    "이 상권에서 어떤 업종이 실제로 잘 되고 있는지 짚어주세요. 이 매출 데이터는 카드매출 기반 "
+    "추정치이며 현금 결제나 특수 상황은 반영되지 않을 수 있다는 점을 표 아래 한 줄로 짧게 "
+    "언급하세요. 매출 데이터가 없는 지역(estimated_sales_summary가 null)이면 '이 지역은 "
+    "서울시 상권분석서비스의 상권 범위에 포함되지 않아 추정매출 데이터를 제공하지 않는다'고만 "
+    "짧게 밝히고 넘어가세요.\n"
+    "5-2) analyze_trade_area 결과의 store_stats_summary, 또는 estimate_shop_rent 결과의 "
+    "폐업_위험도 필드가 있으면 반드시 활용하세요. 이건 '공급이 부족해서 유망하다'는 gap_score "
+    "추정과는 별개로, 실제 그 업종이 이 상권에서 얼마나 안정적으로 살아남는지(폐업률)를 보여주는 "
+    "지표입니다. 폐업률이 높은 업종은 gap_score가 높더라도(공급 부족처럼 보여도) 실제로는 "
+    "'들어와도 오래 못 버티는 업종'일 수 있으니, 이 두 지표를 함께 봐서 모순되는 경우(공급은 "
+    "부족한데 폐업률도 높은 경우) 그 이유를 추정해 설명하세요(예: 초기 진입은 쉽지만 상권 "
+    "특성상 매출이 안 나와 오래 못 버티는 업종일 수 있음). 폐업_위험도.표본_점포수가 3개 미만이면 "
+    "'표본이 적어 폐업률 수치의 신뢰도가 낮다'고 반드시 짧게 밝히세요. store_stats_summary만 "
+    "있는 경우(특정 업종 미지정)는 폐업률_상위5_업종을 통해 이 상권에서 특히 리스크가 큰 업종이 "
+    "무엇인지 짚어주고, 프랜차이즈_비율이 높으면 '개인 창업보다 프랜차이즈 의존도가 높은 상권'이라는 "
+    "점도 함께 언급하세요. 이 데이터는 분기별 카드사·통신사 기반 추정치이며 실제 사업자등록 "
+    "통계와 집계 방식이 다를 수 있다는 점을 표 아래 한 줄로 짧게 언급하세요.\n"
+    "5-3) analyze_trade_area 결과의 transit_accessibility 필드가 있으면 활용하세요. "
+    "정류장_수와 총_경유노선_수_합산으로 도보 대중교통 접근성을 판단할 수 있습니다. "
+    "이건 지하철 유동인구와는 별개 지표이므로, 지하철역 유동인구가 많더라도 버스 접근성이 "
+    "낮으면(정류장이 1~2개뿐이거나 노선 수가 적으면) '역세권이지만 버스 배후 접근성은 약한 "
+    "곳'처럼 구분해서 설명하세요. 반대로 지하철 유동인구는 적어도 버스 정류장·노선이 많으면 "
+    "'버스 환승 거점형 상권'일 수 있다는 점도 짚어주세요. 정류장_수가 0이면 '반경 300m 내 "
+    "버스정류장이 없어 대중교통 접근성이 매우 낮다'고 명확히 밝히세요. 총_경유노선_수_합산은 "
+    "정류장 간 노선이 겹칠 수 있어 참고용 근사치라는 점을 표 아래 한 줄로 짧게 언급하세요. "
+    "이 항목은 짧게 한두 문장으로만 다루고 과도하게 비중을 두지 마세요.\n"
+    "6) 필요하다면 임대료 조정안(할인/인센티브)이나 업종 전환 시나리오도 제안\n"
+    "7) 사용자가 특정 건물 주소를 주면서 그 건물 자체를 물어보면 analyze_building 도구도 "
+    "함께 호출하세요. 이 도구 결과(연면적, 대지면적, 건폐율/용적률, 지상·지하 층수, 승강기 수, "
+    "준공일, 주용도, 구조)가 있으면 답변에 반드시 반영하고, error가 있으면 '이 주소는 건축물대장 "
+    "조회에 실패했다'고 명확히 밝히세요. 이 도구는 상권/유동인구 분석과는 별개이므로, 상권 질문과 "
+    "함께 나오면 analyze_trade_area도 같이 호출하세요.\n"
+    "표 안에서 한 셀에 여러 줄을 적어야 할 때도 '<br>' 같은 HTML 태그는 절대 쓰지 마세요. "
+    "대신 같은 셀 안에서는 가운뎃점(·)이나 쉼표로 구분해 한 줄로 쓰거나, "
+    "필요하면 표 대신 글머리 기호(-) 목록으로 표현하세요. 답변 전체에서 HTML 태그를 "
+    "일절 사용하지 말고 순수 마크다운 문법만 사용하세요.\n"
+    "마크다운 표를 쓸 때는 반드시 다음 형식을 정확히 지키세요: 헤더 행, 구분선 행(|---|---|...), "
+    "데이터 행 각각에서 '|'로 나뉘는 칸의 개수가 컬럼 개수와 정확히 똑같아야 합니다. "
+    "예를 들어 컬럼이 5개(업종, 수요점수, 경쟁강도, 갭, 근거)라면 구분선도 반드시 "
+    "'|------|------|------|------|------|'처럼 5칸으로 맞추세요. 구분선 칸 수가 헤더나 "
+    "데이터 행보다 적으면 표가 아예 깨져서 렌더링되지 않으니, 표를 쓰기 전에 각 행의 '|' 개수를 "
+    "스스로 세어서 모두 동일한지 확인한 뒤 출력하세요.\n"
+    "표나 목록 형태를 적극적으로 활용해 가독성 있게 답변하세요. "
+    "그래프/차트는 화면에 별도로 자동 표시되니, 텍스트에서는 해석과 전략에 집중하세요. "
+    "전체 답변은 각 항목을 핵심 위주로 간결하게 정리하고, 불필요하게 늘어지지 않게 하세요 "
+    "(응답 길이 제한으로 문장이 중간에 잘리는 것을 방지하기 위함입니다)."
+)
+
+
+
+def get_api_key(key_name):
+    """
+    로컬 실행시에는 .env, Streamlit Cloud 배포시에는 st.secrets에서
+    키를 읽어온다. 로컬에는 secrets.toml이 없을 수 있으므로 안전하게 처리.
+    """
+    try:
+        if hasattr(st, "secrets") and key_name in st.secrets:
+            return st.secrets[key_name]
+    except Exception:
+        pass
+    return os.getenv(key_name)
+
+
+ANTHROPIC_API_KEY = get_api_key("ANTHROPIC_API_KEY")
+NAVER_CLIENT_ID_FOR_MAP = get_api_key("NAVER_CLIENT_ID")
+
+TOOLS = [
+    {
+        "name": "analyze_trade_area",
+        "description": (
+            "특정 지역/상권의 유동인구(연령대별, 시간대별), 반경 500m 내 "
+            "업종별 업소 분포, 해당 법정동이 속한 시군구의 평균 상가(평당) 매매가, "
+            "서울시 상권분석서비스의 카드매출 기반 업종별 추정매출(estimated_sales_summary), "
+            "업종별 점포 수·프랜차이즈 비율·개업률·폐업률(store_stats_summary), 그리고 "
+            "반경 300m 내 버스정류장 수·경유노선 수(transit_accessibility)까지 "
+            "함께 조회한다. 상권 분석 질문에는 항상 이 도구를 사용하고, lawd_cd는 "
+            "질문에 나온 지역이 속한 시군구의 법정동코드 5자리를 스스로 판단해서 채운다 "
+            "(예: 서울 동대문구=11230, 서울 강남구=11680 등 널리 알려진 코드 지식을 활용)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "상권 검색 키워드 (예: '청량리역', '경동시장')"},
+                "address": {"type": "string", "description": "지오코딩용 정확한 주소 (예: '서울특별시 동대문구 청량리동')"},
+                "lawd_cd": {"type": "string", "description": "이 지역이 속한 시군구의 법정동코드 5자리"},
+            },
+            "required": ["keyword", "address", "lawd_cd"],
+        },
+    },
+    {
+        "name": "estimate_shop_rent",
+        "description": (
+            "특정 상권, 특정 업종, 특정 평수의 상가에 대해 추천 월 임대료를 계산한다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string"},
+                "address": {"type": "string"},
+                "lawd_cd": {"type": "string", "description": "법정동코드 5자리 (동대문구=11230)"},
+                "deal_ym": {"type": "string", "description": "계약년월 6자리 (예: 202412)"},
+                "category_name": {"type": "string", "description": "업종 중분류명 (예: '한식', '주점')"},
+                "area_pyeong": {"type": "number"},
+                "business_hours": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "시간대_00~06, 시간대_06~11, 시간대_11~14, 시간대_14~17, 시간대_17~21, 시간대_21~24 중 선택",
+                },
+                "floor_weight": {"type": "number", "description": "층수 가중치 (1층=1.0, 2층=0.7 등)"},
+            },
+            "required": ["keyword", "address", "lawd_cd", "deal_ym", "category_name", "area_pyeong", "business_hours"],
+        },
+    },
+    {
+        "name": "analyze_building",
+        "description": (
+            "특정 건물의 실제 건축물대장 정보(연면적, 대지면적, 건폐율/용적률, 지상·지하 층수, "
+            "승강기 수, 준공일/사용승인일, 주용도, 구조 등)를 조회한다. "
+            "사용자가 특정 건물 주소(도로명주소 또는 지번주소)를 주면서 '이 건물', '이 빌딩' "
+            "등으로 건물 자체의 실제 스펙을 물어볼 때 사용한다. 상권/유동인구 분석과는 "
+            "별개이므로, 건물 정보가 필요하면 analyze_trade_area와 함께 호출해도 된다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "건물의 정확한 도로명주소 또는 지번주소"},
+            },
+            "required": ["address"],
+        },
+    },
+]
+
+
+def run_tool(tool_name, tool_input):
+    if tool_name == "analyze_trade_area":
+        result = analyze_single_area(
+            tool_input["keyword"],
+            tool_input["address"],
+            lawd_cd=tool_input.get("lawd_cd"),
+        )
+
+        return {
+            "keyword": result["keyword"],
+            "trdar_cd_nm": result["trdar_cd_nm"],
+            "population": result["population"],
+            "population_trend": result.get("population_trend"),
+            "estimated_sales_summary": summarize_estimated_sales(result.get("estimated_sales")),
+            "store_stats_summary": summarize_store_stats(result.get("store_stats")),
+            "transit_accessibility": result.get("transit_accessibility"),
+            "store_breakdown": store_breakdown_to_plain_dict(result["store_breakdown"]),
+            "average_sale_price": result["price_info"],
+            "price_trend": result.get("price_trend"),
+            "resident_population": result.get("resident_population"),
+            "resident_population_level": result.get("resident_population_level"),
+            "trade_area_match_method": result.get("trade_area_match_method"),
+            "demand_based_recommendations": result.get("demand_recommendations"),
+            "geo": result.get("geo"),
+            "error": result["error"],
+        }
+
+    if tool_name == "estimate_shop_rent":
+        area_result = analyze_single_area(tool_input["keyword"], tool_input["address"])
+        if area_result["error"]:
+            return {"error": area_result["error"]}
+
+        sale_items = get_commercial_sale_prices(tool_input["lawd_cd"], tool_input["deal_ym"])
+        dong_name = (area_result.get("geo") or {}).get("dong_name")
+        # dong_name을 주면 그 동 거래만 우선 쓰고, 없으면 함수 내부에서 구 전체로 자동 대체된다.
+        price_per_pyeong = estimate_price_per_pyeong(sale_items, dong_name=dong_name)
+
+        if price_per_pyeong is None:
+            return {"error": "해당 지역/기간의 매매실거래가 데이터를 찾을 수 없습니다."}
+
+        return estimate_rent(
+            base_price_per_pyeong=price_per_pyeong,
+            area_pyeong=tool_input["area_pyeong"],
+            pop_summary=area_result["population"],
+            store_breakdown=area_result["store_breakdown"],
+            business_hours=tool_input["business_hours"],
+            category_name=tool_input["category_name"],
+            category_level="mid",
+            cap_rate=0.05,
+            floor_weight=tool_input.get("floor_weight", 1.0),
+            estimated_sales_rows=area_result.get("estimated_sales"),
+            store_stats_rows=area_result.get("store_stats"),
+        )
+
+    if tool_name == "analyze_building":
+        return get_building_info(tool_input["address"])
+
+    return {"error": "알 수 없는 도구: " + tool_name}
+
+
+def build_charts_from_tool_call(tool_name, result):
+    """
+    도구 실행 결과에서 화면에 표시할 차트 데이터 목록을 만든다.
+    각 차트는 {"title": ..., "data": {라벨: 값, ...}} 형태.
+    단일 값 하나짜리 막대그래프(매매가, 정주인구 등)는 시각적으로 의미가 적어
+    제외하고, 실제 분포를 보여주는 시간대/연령대/성별 그래프만 유지한다.
+    (매매가/임대료/정주인구/업종 추천 수치는 차트 대신 텍스트 답변에서 설명된다.)
+    """
+    charts = []
+    if result.get("error"):
+        return charts
+
+    if tool_name == "analyze_trade_area":
+        area_name = result.get("trdar_cd_nm") or result.get("keyword") or ""
+        pop = result.get("population") or {}
+
+        age_keys = ["10대", "20대", "30대", "40대", "50대", "60대_이상"]
+        age_data = {k: pop.get(k) for k in age_keys if pop.get(k) is not None}
+        if age_data:
+            charts.append({"title": area_name + " - 연령대별 유동인구", "data": age_data})
+
+        gender_data = {}
+        if pop.get("남성_유동인구") is not None:
+            gender_data["남성"] = pop["남성_유동인구"]
+        if pop.get("여성_유동인구") is not None:
+            gender_data["여성"] = pop["여성_유동인구"]
+        if gender_data:
+            charts.append({"title": area_name + " - 성별 유동인구", "data": gender_data})
+
+        time_keys = [
+            "시간대_00~06", "시간대_06~11", "시간대_11~14",
+            "시간대_14~17", "시간대_17~21", "시간대_21~24",
+        ]
+        time_data = {k: pop.get(k) for k in time_keys if pop.get(k) is not None}
+        if time_data:
+            charts.append({"title": area_name + " - 시간대별 유동인구", "data": time_data})
+
+        population_trend = result.get("population_trend")
+        if population_trend:
+            pop_trend_data = {
+                row["std_ym"]: row["총_유동인구"]
+                for row in population_trend
+                if row.get("총_유동인구") is not None
+            }
+            if len(pop_trend_data) >= 2:  # 값이 1개뿐이면 추이라고 보기 어려우니 생략
+                charts.append({
+                    "title": area_name + " - 총 유동인구 추이(최근 " + str(len(population_trend)) + "개 분기)",
+                    "data": pop_trend_data,
+                    "type": "line",
+                })
+
+        sales_summary = result.get("estimated_sales_summary")
+        if sales_summary and sales_summary.get("매출_상위5_업종"):
+            sales_data = {
+                row["업종명"]: round((row.get("당월_추정매출_원") or 0) / 10000)
+                for row in sales_summary["매출_상위5_업종"]
+            }
+            if sales_data:
+                charts.append({
+                    "title": area_name + " - 업종별 추정매출 상위 5(당월, 만원)",
+                    "data": sales_data,
+                })
+
+        store_stats_summary = result.get("store_stats_summary")
+        if store_stats_summary and store_stats_summary.get("폐업률_상위5_업종"):
+            closure_data = {
+                row["업종명"]: row.get("폐업률") or 0
+                for row in store_stats_summary["폐업률_상위5_업종"]
+            }
+            if closure_data:
+                charts.append({
+                    "title": area_name + " - 업종별 폐업률 상위 5(%, 표본 3개 이상 업종만)",
+                    "data": closure_data,
+                })
+
+        price_trend = result.get("price_trend")
+        if price_trend:
+            trend_data = {
+                row["deal_ym"]: row["avg_price_per_pyeong_manwon"]
+                for row in price_trend
+                if row.get("avg_price_per_pyeong_manwon") is not None
+            }
+            if len(trend_data) >= 2:  # 값이 1개뿐이면 추이라고 보기 어려우니 생략
+                charts.append({
+                    "title": area_name + " - 평당 매매가 추이(최근 " + str(len(price_trend)) + "개월, 만원)",
+                    "data": trend_data,
+                    "type": "line",
+                })
+
+    return charts
+
+
+def render_charts(charts):
+    for chart in charts:
+        st.write("**" + chart["title"] + "**")
+        df = pd.DataFrame({"값": list(chart["data"].values())}, index=list(chart["data"].keys()))
+        if chart.get("type") == "line":
+            st.line_chart(df)
+        else:
+            st.bar_chart(df)
+
+
+import base64
+import re
+
+
+def _is_markdown_table_row(line):
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _is_markdown_table_separator(line):
+    stripped = line.strip()
+    if not _is_markdown_table_row(stripped):
+        return False
+    inner = stripped.strip("|")
+    return all(ch in "-: |" for ch in inner) and "-" in inner
+
+
+def fix_markdown_tables(text):
+    """
+    Claude 답변에 나오는 마크다운 표에서, 구분선 행(|---|---|...)의 칸 수가
+    헤더/데이터 행의 칸 수와 안 맞으면 표 전체가 깨져서 렌더링되지 않는
+    문제가 있었다 (예: 컬럼 5개인데 구분선은 4칸만 있는 경우). 시스템
+    프롬프트로 형식을 지키라고 안내는 했지만 100% 보장은 안 되므로, 화면에
+    그리기 직전에 각 표 블록의 구분선 칸 수를 헤더 행 칸 수에 맞춰 자동으로
+    다시 만들어 표가 항상 정상적으로 렌더링되게 한다.
+    """
+    lines = text.split("\n")
+    fixed_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _is_markdown_table_row(line):
+            # 표의 첫 줄(헤더)만 기준으로 칸 수를 정하고, 구분선은 헤더 바로
+            # 다음에 딱 한 번만 넣는다. 그 뒤로 이어지는 데이터 행들은 원래
+            # 있던 구분선(있다면)만 건너뛰고 그대로 옮긴다 - 데이터 행마다
+            # 구분선을 새로 끼워넣으면 표가 여러 조각으로 쪼개져 버린다.
+            header_cols = line.strip().strip("|").count("|") + 1
+            fixed_lines.append(line)
+            i += 1
+            if i < len(lines) and _is_markdown_table_separator(lines[i]):
+                i += 1  # 원래 있던(칸 수가 틀렸을 수도 있는) 구분선은 버린다.
+            fixed_lines.append("|" + "|".join(["---"] * header_cols) + "|")
+
+            while i < len(lines) and _is_markdown_table_row(lines[i]):
+                if not _is_markdown_table_separator(lines[i]):
+                    fixed_lines.append(lines[i])
+                i += 1
+        else:
+            fixed_lines.append(line)
+            i += 1
+    return "\n".join(fixed_lines)
+
+
+def encode_image_base64(file_bytes):
+    return base64.b64encode(file_bytes).decode("utf-8")
+
+
+def extract_rooms_from_image(client, file_bytes, media_type):
+    """
+    도면 이미지를 Claude 비전으로 읽어서 호실 목록(호실명, 층)을 JSON으로 추출.
+    이미지 상단에 '전용: OOO평 (OO개 호실)' 같은 표기가 있으면 함께 읽어서
+    평균 평수를 자동 계산해 기본값으로 채운다.
+    """
+    b64 = encode_image_base64(file_bytes)
+    instruction = (
+        "이 이미지는 상가 건물의 층별 임대 현황 도면입니다. "
+        "다음 두 가지를 읽어주세요.\n\n"
+        "1) 이미지 상단에 '지상 O층 (OO개 호실) 전용 : OOO.OO평' 같은 표기가 있으면, "
+        "그 층 이름(floor_label), 호실수(total_room_count), 전체 전용면적(total_area_pyeong)을 숫자로 추출\n"
+        "2) 이미지 안에서 보이는 모든 호실(구획) 번호/이름과, 그 호실이 있는 층을 추출\n\n"
+        "다음 JSON 형식으로만 답하세요. 다른 설명은 절대 추가하지 마세요.\n\n"
+        "{\n"
+        '  "floor_label": "지상 3층",\n'
+        '  "total_room_count": 23,\n'
+        '  "total_area_pyeong": 601.79,\n'
+        '  "rooms": [{"room_name": "301", "floor": "지상 3층"}, {"room_name": "302", "floor": "지상 3층"}]\n'
+        "}\n\n"
+        "층 정보가 없으면 floor_label/total_room_count/total_area_pyeong은 null로 두세요. "
+        "확실하지 않은 호실은 rooms 목록에서 제외하세요."
+    )
+
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=3000,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": instruction},
+                ],
+            }
+        ],
+    )
+
+    text = "".join(b.text for b in response.content if b.type == "text")
+
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        parsed = json.loads(match.group(0)) if match else json.loads(text)
+    except Exception as e:
+        st.error("호실 목록 추출 중 JSON 파싱 실패: " + str(e))
+        st.code(text)
+        return [], None
+
+    rooms = parsed.get("rooms", [])
+    total_count = parsed.get("total_room_count")
+    total_area = parsed.get("total_area_pyeong")
+
+    avg_pyeong = None
+    if total_count and total_area and total_count > 0:
+        avg_pyeong = round(total_area / total_count, 2)
+
+    for room in rooms:
+        room["평수"] = avg_pyeong if avg_pyeong is not None else 10.0
+
+    floor_summary = {
+        "floor_label": parsed.get("floor_label"),
+        "total_room_count": total_count,
+        "total_area_pyeong": total_area,
+        "avg_pyeong": avg_pyeong,
+    }
+
+    return rooms, floor_summary
+
+
+def floor_weight_from_label(floor_label):
+    """
+    층 표기 문자열에서 층수 가중치를 추정한다. 1층을 기준으로 위/아래로
+    한 단계씩 멀어질 때마다 CONFIG["FLOOR_WEIGHT"]의 level_1 -> level_2 ->
+    level_3_plus 순서로 할인폭이 커지고, 3단계 이상부터는 더 내려가지 않고
+    level_3_plus 값에서 고정된다(최대 할인 고정).
+
+    - 1층: ground_1 (할인 없음)
+    - 2층 / 지하1층 / 옥상층: level_1
+    - 3층 / 지하2층: level_2
+    - 4층 이상 / 지하3층 이하: level_3_plus (최대 할인, 더 안 내려감)
+    """
+    weights = CONFIG["FLOOR_WEIGHT"]
+    label = floor_label or ""
+
+    # 옥상층은 2층과 동일한 등급(level_1) 취급
+    if "옥상" in label:
+        return weights["level_1"]
+
+    is_basement = ("지하" in label) or bool(re.search(r"B\s*\d", label.upper()))
+
+    match = re.search(r"(\d+)", label)
+    floor_num = int(match.group(1)) if match else None
+
+    if is_basement:
+        depth = floor_num if floor_num else 1  # 지하1층/B1 등, 숫자 없으면 1층으로 취급
+        if depth <= 1:
+            return weights["level_1"]
+        if depth == 2:
+            return weights["level_2"]
+        return weights["level_3_plus"]
+
+    # 지상층
+    if not floor_num or floor_num <= 1:
+        return weights["ground_1"]
+    level = floor_num - 1  # 2층->1단계, 3층->2단계, 4층->3단계...
+    if level == 1:
+        return weights["level_1"]
+    if level == 2:
+        return weights["level_2"]
+    return weights["level_3_plus"]
+
+
+def recommend_categories_for_rooms(client, rooms, area_result):
+    """
+    여러 호실에 대해 한 번의 호출로 적합 업종을 추천받는다.
+    area_result: analyze_single_area()의 반환값 (유동인구 + 업종분포 포함)
+    """
+    sb = area_result.get("store_breakdown")
+    sb_plain = store_breakdown_to_plain_dict(sb) if sb else None
+    context = {
+        "trdar_cd_nm": area_result.get("trdar_cd_nm"),
+        "population": area_result.get("population"),
+        "store_breakdown": sb_plain,
+    }
+
+    instruction = (
+        "당신은 상권 분석 전문가입니다. 아래 상권 데이터를 참고하여, "
+        "주어진 각 호실(층 정보 포함)에 가장 적합한 업종(중분류 수준, 예: '한식', '카페(비알코올)', "
+        "'의원', '기타 간이' 등)과 그 업종의 주 영업시간대를 추천하세요. "
+        "이미 업종 중분류에 개수가 많이 몰려있는 업종(포화 업종)은 가능한 피하고, "
+        "층수 특성(1층=접근성 좋은 업종, 상층/지하=목적성 방문 업종)도 고려하세요.\n\n"
+        "상권 데이터:\n" + json.dumps(context, ensure_ascii=False, default=str) + "\n\n"
+        "호실 목록:\n" + json.dumps(rooms, ensure_ascii=False) + "\n\n"
+        "다음 JSON 배열 형식으로만 답하세요. 다른 설명은 추가하지 마세요.\n"
+        '[{"room_name": "101호", "floor": "1층", "recommended_category": "카페(비알코올)", '
+        '"business_hours": ["시간대_06~11", "시간대_11~14"], "reasoning": "간단한 추천 이유"}]'
+    )
+
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=3000,
+        messages=[{"role": "user", "content": instruction}],
+    )
+
+    text = "".join(b.text for b in response.content if b.type == "text")
+
+    try:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return json.loads(text)
+    except Exception as e:
+        st.error("업종 추천 결과 JSON 파싱 실패: " + str(e))
+        st.code(text)
+        return []
+
+
+
+def describe_tool_call(tool_name, tool_input):
+    if tool_name == "analyze_trade_area":
+        return "🔍 '" + tool_input.get("keyword", "") + "' 상권 분석 중"
+    if tool_name == "estimate_shop_rent":
+        return "💰 '" + tool_input.get("keyword", "") + "' 임대료 계산 중"
+    return "🔧 " + tool_name + " 실행 중"
+
+
+def get_claude_response(client, messages):
+    """
+    도구 호출이 필요 없을 때까지 반복해서 Claude를 호출하고,
+    최종 텍스트 답변, 업데이트된 메시지 목록, 이번 턴 도구 호출 기록(차트용)을 반환.
+    """
+    tool_call_records = []
+
+    while True:
+        response = client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+        text_blocks = [b for b in response.content if b.type == "text"]
+
+        assistant_content = []
+        for b in response.content:
+            if b.type == "text":
+                assistant_content.append({"type": "text", "text": b.text})
+            elif b.type == "tool_use":
+                assistant_content.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        if not tool_use_blocks:
+            final_text = "\n".join(t.text for t in text_blocks)
+            return final_text, messages, tool_call_records
+
+        tool_results = []
+        for tool_use in tool_use_blocks:
+            label = describe_tool_call(tool_use.name, tool_use.input)
+
+            with st.status(label, expanded=True) as status:
+                if tool_use.name == "analyze_trade_area":
+                    st.write("📍 위치(좌표) 확인 중...")
+                    st.write("📊 유동인구 · 업종 데이터 조회 중... (병렬 처리)")
+                    st.write("💰 인근 매매가/임대료 시세 조회 중... (병렬 처리)")
+                elif tool_use.name == "estimate_shop_rent":
+                    st.write("📍 상권 데이터 확인 중...")
+                    st.write("💰 매매실거래가 조회 중...")
+                    st.write("🧮 유동인구·경쟁밀도 반영해 임대료 계산 중...")
+                else:
+                    st.write("처리 중...")
+
+                result = run_tool(tool_use.name, tool_use.input)
+                status.update(label=label + " - 완료", state="complete", expanded=False)
+
+            tool_call_records.append({"name": tool_use.name, "result": result})
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            })
+        messages.append({"role": "user", "content": tool_results})
+
+
+def render_naver_map(lat, lng, title="분석 위치"):
+    """
+    네이버 Static Map API로 서버에서 받아온 지도 이미지를 화면에 표시한다.
+
+    예전에는 Dynamic Map(JS)을 components.html()로 띄웠는데, Streamlit이 이 HTML을
+    샌드박스 iframe(about:srcdoc) 안에서 렌더링하다 보니 네이버 서버가 요청 출처를
+    "about:srcdoc"으로 인식해서 등록된 Web 서비스 URL과 안 맞아 지도가 계속 거부됐다
+    (브라우저 콘솔에 "URI: about:srcdoc" 에러로 확인됨).
+    Static Map은 브라우저가 아니라 이 서버가 직접 ID-KEY로 인증해서 이미지를
+    받아오기 때문에 그 문제 자체가 생기지 않는다.
+    """
+    image_bytes, error = get_static_map_image(lat, lng, title=title)
+    if not image_bytes:
+        st.warning("지도 이미지를 불러오지 못했습니다. 원인: " + str(error))
+        return
+    st.image(image_bytes, caption=title, use_container_width=True)
+
+
+def main():
+    st.set_page_config(page_title="서울시 상권 분석 AI ChatBot", page_icon="🏢")
+
+    # 새 답변이 나올 때 화면이 순간이동하듯 뚝뚝 끊기지 않고
+    # 부드럽게 스크롤되도록 하는 CSS
+    st.markdown(
+        """
+        <style>
+        html, body, [data-testid="stAppViewContainer"] {
+            scroll-behavior: smooth !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("🏢 서울시 상권 분석 AI ChatBot")
+    st.caption("궁금한 상권의 유동인구, 업종 분포, 추천 임대료를 물어보세요.")
+
+    if not ANTHROPIC_API_KEY:
+        st.error("ANTHROPIC_API_KEY가 설정되지 않았습니다. .env 또는 Streamlit secrets를 확인하세요.")
+        st.stop()
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    with st.sidebar:
+        st.header("📐 도면 기반 호실별 분석")
+
+        uploaded_file = st.file_uploader("상가 도면 이미지 업로드", type=["png", "jpg", "jpeg"])
+        keyword = st.text_input("상권 키워드 (예: OO역)", key="floor_keyword")
+        address = st.text_input("지오코딩 주소 (예: 서울특별시 OO구 OO동)", key="floor_address")
+        lawd_cd = st.text_input("법정동코드 5자리", value="11230", key="floor_lawd")
+        deal_ym = st.text_input("매매실거래가 계약년월 6자리", value="202412", key="floor_deal_ym")
+
+        if st.button("호실 목록 초기화"):
+            st.session_state.extracted_rooms = []
+            st.session_state.room_price_results = []
+
+        if uploaded_file and st.button("1단계: 호실 목록 추출 (현재 업로드된 층 추가)"):
+            file_bytes = uploaded_file.getvalue()
+            media_type = uploaded_file.type
+            with st.spinner("도면에서 호실 읽는 중..."):
+                new_rooms, floor_summary = extract_rooms_from_image(client, file_bytes, media_type)
+
+            if "extracted_rooms" not in st.session_state:
+                st.session_state.extracted_rooms = []
+
+            existing_keys = {(r.get("room_name"), r.get("floor")) for r in st.session_state.extracted_rooms}
+            for r in new_rooms:
+                key = (r.get("room_name"), r.get("floor"))
+                if key not in existing_keys:
+                    st.session_state.extracted_rooms.append(r)
+                    existing_keys.add(key)
+
+            if floor_summary and floor_summary.get("avg_pyeong"):
+                st.info(
+                    (floor_summary.get("floor_label") or "이 층") + ": "
+                    + str(floor_summary.get("total_room_count")) + "개 호실, "
+                    + "전체 " + str(floor_summary.get("total_area_pyeong")) + "평 "
+                    + "→ 평균 " + str(floor_summary.get("avg_pyeong")) + "평/호실로 기본 반영됨"
+                )
+
+        if st.session_state.get("extracted_rooms"):
+            st.write("추출된 호실 목록 - 평수는 층 평균값이 기본으로 채워져 있어요. 필요시 직접 수정하세요.")
+            rooms_df = pd.DataFrame(st.session_state.extracted_rooms)
+            if "평수" not in rooms_df.columns:
+                rooms_df["평수"] = 10.0
+
+            edited_df = st.data_editor(rooms_df, num_rows="dynamic", key="rooms_editor")
+
+            if st.button("2단계: 업종 추천 + 임대료 계산"):
+                if not keyword or not address:
+                    st.warning("상권 키워드와 주소를 입력해주세요.")
+                else:
+                    with st.spinner("상권 데이터 조회 중..."):
+                        area_result = analyze_single_area(keyword, address)
+
+                    if area_result["error"]:
+                        st.error(area_result["error"])
+                    else:
+                        rooms_list = edited_df.to_dict("records")
+                        with st.spinner("호실별 업종 추천 중..."):
+                            recommendations = recommend_categories_for_rooms(client, rooms_list, area_result)
+
+                        sale_items = get_commercial_sale_prices(lawd_cd, deal_ym)
+                        price_per_pyeong = estimate_price_per_pyeong(sale_items)
+
+                        result_rows = []
+                        for rec in recommendations:
+                            room_name = rec.get("room_name")
+                            floor = rec.get("floor", "")
+                            category = rec.get("recommended_category", "")
+                            hours = rec.get("business_hours", [])
+                            reasoning = rec.get("reasoning", "")
+
+                            area_pyeong = 10.0
+                            if "room_name" in edited_df.columns:
+                                match_row = edited_df[edited_df["room_name"] == room_name]
+                                if not match_row.empty and "평수" in match_row.columns:
+                                    area_pyeong = float(match_row.iloc[0]["평수"])
+
+                            floor_weight = floor_weight_from_label(floor)
+
+                            monthly_rent = None
+                            if price_per_pyeong is not None:
+                                rent_result = estimate_rent(
+                                    base_price_per_pyeong=price_per_pyeong,
+                                    area_pyeong=area_pyeong,
+                                    pop_summary=area_result["population"],
+                                    store_breakdown=area_result["store_breakdown"],
+                                    business_hours=hours,
+                                    category_name=category,
+                                    category_level="mid",
+                                    cap_rate=0.05,
+                                    floor_weight=floor_weight,
+                                )
+                                monthly_rent = rent_result["최종_추천_월임대료_만원"]
+
+                            result_rows.append({
+                                "호실": room_name,
+                                "층": floor,
+                                "평수": area_pyeong,
+                                "추천업종": category,
+                                "추천월임대료(만원)": monthly_rent,
+                                "추천이유": reasoning,
+                            })
+
+                        st.session_state.room_price_results = result_rows
+
+        if st.session_state.get("room_price_results"):
+            st.subheader("호실별 추천 결과")
+            result_df = pd.DataFrame(st.session_state.room_price_results)
+            st.dataframe(result_df, use_container_width=True)
+
+    if "display_messages" not in st.session_state:
+        st.session_state.display_messages = []
+    if "api_messages" not in st.session_state:
+        st.session_state.api_messages = []
+
+    for idx, msg in enumerate(st.session_state.display_messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(fix_markdown_tables(msg["content"]))
+            if msg.get("charts"):
+                render_charts(msg["charts"])
+            if msg.get("map_info"):
+                render_naver_map(msg["map_info"]["lat"], msg["map_info"]["lng"], msg["map_info"]["title"])
+
+    user_input = st.chat_input("예: OO역 상권은 어때?")
+
+    if user_input:
+        st.session_state.display_messages.append({"role": "user", "content": user_input, "charts": []})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        st.session_state.api_messages.append({"role": "user", "content": user_input})
+
+        with st.chat_message("assistant"):
+            with st.spinner("생각 중..."):
+                final_text, updated_messages, tool_call_records = get_claude_response(
+                    client, st.session_state.api_messages
+                )
+            st.markdown(fix_markdown_tables(final_text))
+
+            all_charts = []
+            map_info = None
+            for record in tool_call_records:
+                all_charts.extend(build_charts_from_tool_call(record["name"], record["result"]))
+                if record["name"] == "analyze_trade_area":
+                    geo = record["result"].get("geo")
+                    if geo and geo.get("lat") and geo.get("lng"):
+                        map_info = {
+                            "lat": geo["lat"],
+                            "lng": geo["lng"],
+                            "title": record["result"].get("trdar_cd_nm") or record["result"].get("keyword", ""),
+                        }
+
+            if all_charts:
+                render_charts(all_charts)
+            if map_info:
+                st.write("**📍 위치 확인 (네이버 지도)**")
+                render_naver_map(map_info["lat"], map_info["lng"], map_info["title"])
+
+        st.session_state.api_messages = updated_messages
+        st.session_state.display_messages.append({
+            "role": "assistant",
+            "content": final_text,
+            "charts": all_charts,
+            "map_info": map_info,
+        })
+
+
+if __name__ == "__main__":
+    main()

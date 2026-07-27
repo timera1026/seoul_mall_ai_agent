@@ -1,0 +1,15 @@
+# API 키/비밀정보 - 절대 GitHub에 올리면 안 됨
+.env
+.env.*
+!.env.example
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# Streamlit 로컬 secrets (Cloud에서는 Settings의 Secrets를 사용)
+.streamlit/secrets.toml
+
+# OS/에디터 잡파일
+.DS_Store
+Thumbs.db
