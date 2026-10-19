@@ -1649,7 +1649,7 @@ def estimate_rent(base_price_per_pyeong, area_pyeong, pop_summary, store_breakdo
     return result
 
 
-def analyze_single_area(keyword, address, target_std_ym="20241", radius_m=None, lawd_cd=None):
+def analyze_single_area(keyword, address, target_std_ym=None, radius_m=None, lawd_cd=None):
     """
     지역 키워드 하나를 받아서 좌표, 상권코드, 유동인구, 업종분포, (가능하면) 평균 매매가·정주인구까지
     한 번에 조회하는 챗봇용 함수.
@@ -1664,6 +1664,11 @@ def analyze_single_area(keyword, address, target_std_ym="20241", radius_m=None, 
     """
     if radius_m is None:
         radius_m = CONFIG["DEFAULT_RADIUS_M"]
+    if target_std_ym is None:
+        # 예전에는 "20241"(2024년 1분기)로 고정돼 있었다. 이제는 실제로 데이터가
+        # 올라와 있는 가장 최근 분기를 자동으로 찾아서 쓴다.
+        from foot_traffic import find_latest_quarter
+        target_std_ym = find_latest_quarter() or "20241"
     verified_lawd_cd = find_lawd_cd_by_gu_name(address) or find_lawd_cd_by_gu_name(keyword)
     if verified_lawd_cd:
         lawd_cd = verified_lawd_cd
@@ -1684,6 +1689,7 @@ def analyze_single_area(keyword, address, target_std_ym="20241", radius_m=None, 
         "resident_population": None,
         "resident_population_level": None,
         "demand_recommendations": None,
+        "std_ym": target_std_ym,
         "error": None,
     }
 
@@ -1772,6 +1778,15 @@ def analyze_single_area(keyword, address, target_std_ym="20241", radius_m=None, 
             result["price_info"] = derive_price_info_from_trend(result["price_trend"])
         if resident_pop_code:
             result["resident_population"] = tasks["resident_population"].result()
+
+    # 추정매출·점포통계는 유동인구보다 한 분기 늦게 올라오는 경우가 있어서, 비어 있으면 직전 분기로 재시도
+    from foot_traffic import previous_quarter
+    if not result["estimated_sales"]:
+        result["estimated_sales"] = get_estimated_sales(
+            primary["trdar_cd"], previous_quarter(target_std_ym), geo.get("dong_name")
+        )
+    if not result["store_stats"]:
+        result["store_stats"] = get_store_stats(primary["trdar_cd"], previous_quarter(target_std_ym))
 
     result["demand_recommendations"] = recommend_categories_by_demand(
         result["population"], result["store_breakdown"], result["resident_population"]

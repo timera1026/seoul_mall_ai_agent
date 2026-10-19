@@ -25,7 +25,16 @@ from compare_trade_area import (
     get_static_map_image,
     summarize_estimated_sales,
     summarize_store_stats,
+    summarize_population,
+    geocode_naver,
+    find_trade_area_codes,
+    find_nearest_trade_area,
     CONFIG,
+)
+from foot_traffic import (
+    analyze_foot_traffic,
+    estimate_target_customers,
+    inspect_new_apis,
 )
 
 MODEL_NAME = "claude-sonnet-4-5"
@@ -101,6 +110,15 @@ SYSTEM_PROMPT = (
     "버스정류장이 없어 대중교통 접근성이 매우 낮다'고 명확히 밝히세요. 총_경유노선_수_합산은 "
     "정류장 간 노선이 겹칠 수 있어 참고용 근사치라는 점을 표 아래 한 줄로 짧게 언급하세요. "
     "이 항목은 짧게 한두 문장으로만 다루고 과도하게 비중을 두지 마세요.\n"
+    "5-4) analyze_foot_traffic 결과가 있으면 '사람이 언제, 누가, 왜 오는지'를 설명하세요. "
+    "주중_하루평균과 주말_하루평균을 비교해 '평일 직장인형/주말 나들이형' 상권인지 판단하고, "
+    "직장인구가 많으면 점심·퇴근 수요를, 집객시설(학교·병원·관공서 등)이 있으면 그 시설이 "
+    "끌어오는 고객층을 짚어주세요. 지하철_승하차의 역_성격(출근 도착형/퇴근 귀가형)과 "
+    "하차_피크_시간을 활용해 '몇 시에 이 동네로 사람이 들어오는지' 설명하세요. 지하철 데이터가 "
+    "error면 '해당 역 승하차 데이터를 가져오지 못했다'고만 짧게 밝히세요.\n"
+    "5-5) estimate_target_customers 결과가 있으면 '하루 관심고객 약 O명, 예상 방문객 하루 "
+    "O~O명(전환율 1~4% 가정)' 형태로 반드시 숫자를 제시하세요. 이 숫자는 유동인구 분기합계를 "
+    "하루로 나누고 방문 전환율을 가정한 추정치라는 점을 한 줄로 짧게 밝히세요.\n"
     "6) 필요하다면 임대료 조정안(할인/인센티브)이나 업종 전환 시나리오도 제안\n"
     "7) 사용자가 특정 건물 주소를 주면서 그 건물 자체를 물어보면 analyze_building 도구도 "
     "함께 호출하세요. 이 도구 결과(연면적, 대지면적, 건폐율/용적률, 지상·지하 층수, 승강기 수, "
@@ -208,6 +226,80 @@ TOOLS = [
 ]
 
 
+TIME_SLOT_ENUM = ["시간대_00~06", "시간대_06~11", "시간대_11~14", "시간대_14~17", "시간대_17~21", "시간대_21~24"]
+AGE_ENUM = ["10대", "20대", "30대", "40대", "50대", "60대_이상"]
+DAY_ENUM = ["월", "화", "수", "목", "금", "토", "일"]
+
+TOOLS += [
+    {
+        "name": "analyze_foot_traffic",
+        "description": (
+            "특정 위치/상권의 '인적 동선'을 정밀하게 분석한다. 요일별 유동인구(주중·주말 하루평균), "
+            "성별×연령별 유동인구, 직장인구, 집객시설(지하철역·학교·병원·관공서 수 등), "
+            "그리고 주변 지하철역의 시간대별 하루평균 승·하차 인원과 역 성격(출근 도착형/퇴근 귀가형)을 "
+            "조회한다. 유동인구가 '언제, 누가' 오는지 자세히 묻거나 창업 입지를 판단할 때 사용한다. "
+            "station_names에는 그 위치에서 걸어갈 수 있는 가까운 지하철역 이름을 스스로 판단해 1~3개 넣는다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "상권 검색 키워드 (예: '청량리역')"},
+                "address": {"type": "string", "description": "지오코딩용 주소 (예: '서울특별시 동대문구 청량리동')"},
+                "station_names": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "근처 지하철역 이름 1~3개 (예: ['청량리', '회기'])",
+                },
+            },
+            "required": ["keyword", "address"],
+        },
+    },
+    {
+        "name": "estimate_target_customers",
+        "description": (
+            "창업하려는 업종의 주 고객층(연령·성별)과 영업시간·영업요일을 받아서, 이 위치에서 "
+            "하루에 지나가는 '관심고객 수'와 실제 매장에 들를 '예상 방문객 수'(전환율 1%/2%/4% 세 가지 "
+            "시나리오)를 추정한다. 사용자가 '손님이 몇 명쯤 올까', '관심고객이 얼마나 될까'를 묻거나 "
+            "특정 업종의 입지를 평가할 때 사용한다. 업종만 주어지면 그 업종의 일반적인 주 고객층과 "
+            "영업시간을 스스로 판단해서 채운다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string"},
+                "address": {"type": "string"},
+                "target_ages": {"type": "array", "items": {"type": "string", "enum": AGE_ENUM}},
+                "target_gender": {"type": "string", "enum": ["전체", "남성", "여성"]},
+                "business_hours": {"type": "array", "items": {"type": "string", "enum": TIME_SLOT_ENUM}},
+                "open_days": {"type": "array", "items": {"type": "string", "enum": DAY_ENUM}},
+            },
+            "required": ["keyword", "address", "target_ages", "business_hours"],
+        },
+    },
+]
+
+
+def resolve_trade_area(keyword, address):
+    """키워드/주소 -> (상권코드, 상권명, 좌표). analyze_single_area보다 가벼운 버전."""
+    geo = None
+    for candidate in [keyword, address]:
+        if not candidate:
+            continue
+        try:
+            geo = geocode_naver(candidate)
+            break
+        except Exception:
+            continue
+    areas = find_trade_area_codes(keyword) if keyword else []
+    if areas:
+        priority_order = {"발달상권": 0, "전통시장": 1, "골목상권": 2, "관광특구": 3}
+        primary = sorted(areas, key=lambda a: priority_order.get(a["trdar_se_cd_nm"], 99))[0]
+    elif geo:
+        primary = find_nearest_trade_area(geo["lat"], geo["lng"])
+    else:
+        primary = None
+    return primary, geo
+
+
 def run_tool(tool_name, tool_input):
     if tool_name == "analyze_trade_area":
         result = analyze_single_area(
@@ -264,6 +356,30 @@ def run_tool(tool_name, tool_input):
 
     if tool_name == "analyze_building":
         return get_building_info(tool_input["address"])
+
+    if tool_name in ("analyze_foot_traffic", "estimate_target_customers"):
+        primary, geo = resolve_trade_area(tool_input.get("keyword"), tool_input.get("address"))
+        if not primary:
+            return {"error": "상권을 찾지 못했습니다: " + str(tool_input.get("keyword"))}
+        detail = analyze_foot_traffic(primary["trdar_cd"], station_names=tool_input.get("station_names"))
+        pop_summary = summarize_population(detail.pop("flpop_rows", None))
+        base = {"keyword": tool_input.get("keyword"), "trdar_cd_nm": primary.get("trdar_cd_nm"), "geo": geo}
+
+        if tool_name == "analyze_foot_traffic":
+            base.update(detail)
+            base["유동인구_요약"] = pop_summary
+            return base
+
+        base["기준_분기"] = detail.get("기준_분기")
+        base["관심고객_추정"] = estimate_target_customers(
+            pop_summary,
+            detail.get("유동인구_상세"),
+            target_ages=tool_input.get("target_ages"),
+            target_gender=tool_input.get("target_gender", "전체"),
+            business_hours=tool_input.get("business_hours"),
+            open_days=tool_input.get("open_days"),
+        )
+        return base
 
     return {"error": "알 수 없는 도구: " + tool_name}
 
@@ -355,6 +471,20 @@ def build_charts_from_tool_call(tool_name, result):
                     "title": area_name + " - 평당 매매가 추이(최근 " + str(len(price_trend)) + "개월, 만원)",
                     "data": trend_data,
                     "type": "line",
+                })
+
+    if tool_name == "analyze_foot_traffic":
+        area_name = result.get("trdar_cd_nm") or result.get("keyword") or ""
+        detail = result.get("유동인구_상세") or {}
+        by_day = {k: v for k, v in (detail.get("요일별") or {}).items() if v is not None}
+        if by_day:
+            charts.append({"title": area_name + " - 요일별 유동인구(분기 합계)", "data": by_day})
+        for sw in result.get("지하철_승하차") or []:
+            hourly = sw.get("시간대별_하루평균")
+            if hourly:
+                charts.append({
+                    "title": sw.get("station", "") + "역 - 시간대별 하루평균 하차 인원(" + str(sw.get("month")) + ")",
+                    "data": {h: v["하차"] for h, v in hourly.items()},
                 })
 
     return charts
@@ -590,6 +720,10 @@ def describe_tool_call(tool_name, tool_input):
         return "🔍 '" + tool_input.get("keyword", "") + "' 상권 분석 중"
     if tool_name == "estimate_shop_rent":
         return "💰 '" + tool_input.get("keyword", "") + "' 임대료 계산 중"
+    if tool_name == "analyze_foot_traffic":
+        return "🚶 '" + tool_input.get("keyword", "") + "' 인적 동선 분석 중"
+    if tool_name == "estimate_target_customers":
+        return "🎯 '" + tool_input.get("keyword", "") + "' 관심고객 수 추정 중"
     return "🔧 " + tool_name + " 실행 중"
 
 
@@ -697,6 +831,12 @@ def main():
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     with st.sidebar:
+        with st.expander("🔧 데이터 점검 (개발용)"):
+            st.caption("새로 연결한 서울시 API들이 실제로 데이터를 주는지, 필드 이름이 무엇인지 확인합니다.")
+            if st.button("점검 실행"):
+                with st.spinner("API 확인 중..."):
+                    st.json(inspect_new_apis())
+
         st.header("📐 도면 기반 호실별 분석")
 
         uploaded_file = st.file_uploader("상가 도면 이미지 업로드", type=["png", "jpg", "jpeg"])
@@ -838,7 +978,7 @@ def main():
             map_info = None
             for record in tool_call_records:
                 all_charts.extend(build_charts_from_tool_call(record["name"], record["result"]))
-                if record["name"] == "analyze_trade_area":
+                if record["name"] in ("analyze_trade_area", "analyze_foot_traffic", "estimate_target_customers"):
                     geo = record["result"].get("geo")
                     if geo and geo.get("lat") and geo.get("lng"):
                         map_info = {
