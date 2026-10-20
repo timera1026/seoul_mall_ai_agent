@@ -193,7 +193,7 @@ def summarize_worker_population(rows):
 
 
 FACILITY_LABELS = {
-    "VIATR_FCLTY_IDX": "집객시설_수",
+    "VIATR_FCLTY_CO": "집객시설_수",
     "SUBWAY_STATN_CO": "지하철역_수",
     "BUS_STTN_CO": "버스정류장_수",
     "BUS_TRMINL_CO": "버스터미널_수",
@@ -203,7 +203,7 @@ FACILITY_LABELS = {
     "MSKUL_CO": "중학교_수",
     "ELESCH_CO": "초등학교_수",
     "KNDRGR_CO": "유치원_수",
-    "GENRL_HSPTL_CO": "종합병원_수",
+    "GEHSPT_CO": "종합병원_수",
     "GNRL_HSPTL_CO": "일반병원_수",
     "PBLOFC_CO": "관공서_수",
     "BANK_CO": "은행_수",
@@ -211,7 +211,8 @@ FACILITY_LABELS = {
     "SUPMK_CO": "슈퍼마켓_수",
     "THEAT_CO": "극장_수",
     "STAYNG_FCLTY_CO": "숙박시설_수",
-    "PHARMACY_CO": "약국_수",
+    "PARMACY_CO": "약국_수",
+    "ARPRT_CO": "공항_수",
 }
 
 
@@ -498,6 +499,16 @@ def inspect_new_apis():
     for service in ("VwsmTrdarFlpopQq", "VwsmTrdarWrcPopltnQq", "VwsmTrdarFcltyQq"):
         rows, total, msg = _seoul_get(service, 1, 1, std_ym or "")
         report[service] = {"결과": msg, "전체건수": total, "필드": list(rows[0].keys()) if rows else []}
+        if service == "VwsmTrdarFlpopQq" and rows:
+            # 값의 단위(분기 합계인지 하루 평균인지) 확인용 샘플
+            r = rows[0]
+            days = sum(_to_num(r.get(f)) or 0 for f in DAY_FIELDS.values())
+            report["유동인구_샘플"] = {
+                "상권명": r.get("TRDAR_CD_NM"),
+                "총_유동인구": r.get("TOT_FLPOP_CO"),
+                "월요일": r.get("MON_FLPOP_CO"),
+                "요일합계": days,
+            }
     today = date.today()
     y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
     rows, total, msg = _seoul_get("CardSubwayTime", 1, 1, "{:04d}{:02d}".format(y, m))
