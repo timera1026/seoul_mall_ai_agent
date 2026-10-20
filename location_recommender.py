@@ -99,11 +99,18 @@ def per_store_table(svc, sales, stores):
 
 
 def calibrated_sales(svc, raw, seoul_median):
-    """원자료 점포당 매출 -> (서울 평균 대비 지수, 업종 기준값을 곱한 월매출 추정 만원)."""
-    bench = BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK)
+    """
+    원자료 점포당 매출 -> (서울 평균 대비 지수, 월매출 만원).
+    SALES_MODE가 "raw"면 서울시 추정매출을 전체 매출로 보고 그대로 쓰고,
+    "benchmark"면 업종 기준값 × 지수(0.4~2.5배로 제한)를 쓴다.
+    """
     if not raw or not seoul_median:
-        return None, None
-    idx = max(INDEX_MIN, min(INDEX_MAX, raw / seoul_median))
+        return None, (round(raw) if raw and CONFIG.get("SALES_MODE") == "raw" else None)
+    idx = raw / seoul_median
+    if CONFIG.get("SALES_MODE") == "raw":
+        return round(idx, 2), round(raw)
+    bench = BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK)
+    idx = max(INDEX_MIN, min(INDEX_MAX, idx))
     return round(idx, 2), round(bench * idx)
 
 
@@ -284,9 +291,8 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         "매출_기준_분기": sales_q,
         "유동인구_기준_분기": flpop_q,
         "비교한_상권_수": len(candidates),
-        "업종_표준_월매출_만원(서울 평균 점포 가정)": BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK),
-        "서울시_원자료_점포당_중앙값_만원": round(seoul_median) if seoul_median else None,
+        "서울_점포당_월매출_중앙값_만원": round(seoul_median) if seoul_median else None,
         "추천_상권": candidates[:top_n],
         "점수_계산법": "점포당 매출(서울 평균 대비) 45% + 관심 유동인구 30% + 낮은 폐업률 25% (각각 비교 상권 중 백분위)",
-        "참고": "점포당 월매출은 업종 표준 매출 × 서울 평균 대비 지수로 만든 추정치. 서울시 카드매출 원자료는 실제보다 낮게 나오는 경향이 있어 상대 비교에만 씀. 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외",
+        "참고": "점포당 월매출 = 서울시 추정매출(카드결제 보정값, 전체 매출로 간주) ÷ 같은 업종 점포 수(프랜차이즈 포함). 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외",
     }

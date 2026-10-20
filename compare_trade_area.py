@@ -69,6 +69,11 @@ CONFIG = {
     # 단, 이 원자료는 실제 매출보다 꽤 낮게 나오므로 창업자용 매출 금액은
     # location_recommender.BENCHMARK_MONTHLY_SALES(업종 표준 매출)에 '상대 지수'를 곱해 만든다.
     "SALES_AMT_MONTHS": 1,
+
+    # 매출 금액을 어떻게 정할지:
+    #  "raw"       = 서울시 추정매출(카드매출 보정값)을 실제 전체 매출로 보고 그대로 쓴다 (기본)
+    #  "benchmark" = 업종 표준 매출 × 서울 평균 대비 지수 (location_recommender.BENCHMARK_MONTHLY_SALES)
+    "SALES_MODE": "raw",
 }
 
 # 서울시 25개 자치구 법정동코드(5자리) 매핑표.

@@ -5,8 +5,8 @@
 
 계산 순서
   1) 예상 월매출
-     - 방법 1 (주 계산): 업종 표준 월매출 × 이 상권의 '서울 평균 대비 매출 지수' × 층수·면적 보정
-                          (지수 = 이 상권 점포당 카드매출 ÷ 서울 전체 점포당 카드매출 중앙값)
+     - 방법 1 (주 계산): 이 상권 같은 업종의 점포당 월매출 × 층수·면적 보정
+                          (점포당 월매출 = 서울시 추정매출 ÷ 점포 수. 추정매출을 전체 매출로 간주)
      - 방법 2 (검산용): 하루 예상 방문객 × 객단가(결제 1건당 평균 금액) × 한 달 영업일
      - 보수(평균의 70%) / 보통(100%) /낙관(120%) 세 가지 시나리오
        (새 가게는 첫해에 동네 평균보다 못 버는 경우가 많아서 보수 시나리오를 함께 본다)
@@ -194,7 +194,6 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
     trdar_cd = str(trdar_cd)
     gu = (meta.get(trdar_cd) or {}).get("자치구")
     table, seoul_median = per_store_table(svc, sales, stores)
-    bench = BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK)
 
     def _median(vals):
         vals = sorted(v for v in vals if v)
@@ -251,7 +250,7 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
         "매출_기준": source,
         "매출_기준_분기": sales_q,
         "매출_보정": {
-            "업종_표준_월매출_만원": bench,
+            "서울_점포당_월매출_중앙값_만원": round(seoul_median) if seoul_median else None,
             "서울평균_대비_매출지수": idx,
             "동네_평균_점포_월매출_만원": round(base_raw) if base_raw else None,
             "층수_보정": round(ff, 2), "면적_보정": round(sf, 2),
@@ -260,7 +259,7 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
         "검산_관심고객_기준": visitors_check,
         "매물": {"평수": area_pyeong, "층": floor, "보증금_만원": deposit, "월세_만원": monthly_rent,
                "관리비_만원": result["가정값"]["관리비_만원"], "권리금_만원": premium},
-        "주의": "동네 매출 수준은 서울시 카드매출 데이터의 상대 비교로, 금액 수준은 업종 표준 매출(가정값)로 정함. 세금(부가세·소득세)과 사장 본인 인건비는 빠져 있고, "
+        "주의": "서울시 추정매출(카드결제 보정값)을 전체 매출로 보고 계산함. 세금(부가세·소득세)과 사장 본인 인건비는 빠져 있고, "
                "가맹점이면 로열티·물류비가 추가될 수 있음",
     })
     return result

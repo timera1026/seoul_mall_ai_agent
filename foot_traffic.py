@@ -574,9 +574,9 @@ def inspect_new_apis():
         from compare_trade_area import CONFIG
         rec = recommend_locations("커피-음료", top_n=1)
         report["매출단위_점검_카페"] = {
-            "서울시_원자료_점포당_중앙값_만원": rec.get("서울시_원자료_점포당_중앙값_만원"),
+            "서울_카페_점포당_월매출_중앙값_만원": rec.get("서울_점포당_월매출_중앙값_만원"),
             "현재_나누는_값": CONFIG["SALES_AMT_MONTHS"],
-            "업종_표준_월매출_만원": rec.get("업종_표준_월매출_만원(서울 평균 점포 가정)"),
+            "매출_방식": CONFIG.get("SALES_MODE"),
             "비교한_상권_수": rec.get("비교한_상권_수"),
             "error": rec.get("error"),
         }
