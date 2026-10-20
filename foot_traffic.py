@@ -63,22 +63,71 @@ def _seoul_get(service, start, end, *params):
     return rows, total, msg
 
 
-def _fetch_rows_for_trdar(service, trdar_cd, std_ym, max_pages=10):
-    """특정 분기(std_ym)의 전체 상권 데이터 중 trdar_cd 상권 행만 골라낸다."""
-    matched = []
-    page_size = 1000
-    for page in range(max_pages):
-        start = page * page_size + 1
-        end = start + page_size - 1
-        rows, total, _ = _seoul_get(service, start, end, std_ym)
-        if not rows:
-            break
-        for r in rows:
-            if str(r.get("TRDAR_CD")) == str(trdar_cd):
-                matched.append(r)
-        if matched or end >= total:
-            break
-    return matched
+# ---------------------------------------------------------------------------
+# 분기별 '서울 전체 상권 표' 불러오기 (+ 메모리 캐시)
+#   서울시 API는 상권코드로 바로 검색이 안 돼서, 표 전체를 받은 뒤 원하는 상권을
+#   골라야 한다. 한 페이지(1000행)씩 순서대로 받으면 느리므로 여러 페이지를 동시에
+#   받고, 한 번 받은 표는 12시간 동안 기억해 두고 다시 쓴다.
+#   또, 일부 API(직장인구·집객시설)는 분기 조건을 줘도 여러 분기가 섞여 오는
+#   경우가 있어서, 행의 STDR_YYQU_CD(기준 분기)를 직접 확인해 원하는 분기만 남긴다.
+# ---------------------------------------------------------------------------
+
+import time
+import threading
+
+_TABLE_CACHE = {}
+_TABLE_LOCK = threading.Lock()
+TABLE_TTL_SEC = 12 * 3600
+MAX_TABLE_ROWS = 200000
+
+
+def load_quarter_table(service, std_ym, keep_fields=None):
+    """
+    service 표에서 std_ym 분기 행들을 모두 가져온다.
+    반환: (rows, 실제_사용된_분기, 메시지)
+      - 원하는 분기가 표에 없으면, 표 안의 가장 최근 분기를 대신 쓴다.
+    keep_fields를 주면 그 필드만 남겨 메모리를 아낀다.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    cache_key = (service, std_ym, tuple(keep_fields) if keep_fields else None)
+    with _TABLE_LOCK:
+        hit = _TABLE_CACHE.get(cache_key)
+    if hit and time.time() - hit[0] < TABLE_TTL_SEC:
+        return hit[1], hit[2], "캐시"
+
+    first, total, msg = _seoul_get(service, 1, 1000, std_ym)
+    if not first:
+        return [], None, msg
+    if total > MAX_TABLE_ROWS:
+        return [], None, "표가 너무 큼(" + str(total) + "행) - 전체 조회를 건너뜀"
+
+    pages = [(start, start + 999) for start in range(1001, total + 1, 1000)]
+    all_rows = list(first)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for rows, _, _ in ex.map(lambda se: _seoul_get(service, se[0], se[1], std_ym), pages):
+            all_rows.extend(rows)
+
+    used = std_ym
+    if all_rows and "STDR_YYQU_CD" in all_rows[0]:
+        exact = [r for r in all_rows if str(r.get("STDR_YYQU_CD")) == str(std_ym)]
+        if not exact:
+            used = max(str(r.get("STDR_YYQU_CD")) for r in all_rows)
+            exact = [r for r in all_rows if str(r.get("STDR_YYQU_CD")) == used]
+        all_rows = exact
+
+    if keep_fields:
+        all_rows = [{k: r.get(k) for k in keep_fields} for r in all_rows]
+
+    with _TABLE_LOCK:
+        _TABLE_CACHE[cache_key] = (time.time(), all_rows, used)
+    return all_rows, used, "정상"
+
+
+def _fetch_rows_for_trdar(service, trdar_cd, std_ym):
+    """std_ym 분기 표에서 trdar_cd 상권 행만 골라낸다."""
+    rows, _, _ = load_quarter_table(service, std_ym)
+    return [r for r in rows if str(r.get("TRDAR_CD")) == str(trdar_cd)]
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +558,10 @@ def inspect_new_apis():
                 "월요일": r.get("MON_FLPOP_CO"),
                 "요일합계": days,
             }
+    for service in ("VwsmTrdarSelngQq", "VwsmTrdhlStorQq", "TbgisTrdarRelm"):
+        rows, total, msg = _seoul_get(service, 1, 1, "" if service == "TbgisTrdarRelm" else (std_ym or ""))
+        report[service] = {"결과": msg, "전체건수": total, "필드": list(rows[0].keys()) if rows else [],
+                           "첫행_분기": rows[0].get("STDR_YYQU_CD") if rows else None}
     today = date.today()
     y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
     rows, total, msg = _seoul_get("CardSubwayTime", 1, 1, "{:04d}{:02d}".format(y, m))

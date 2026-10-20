@@ -31,6 +31,7 @@ from compare_trade_area import (
     find_nearest_trade_area,
     CONFIG,
 )
+from location_recommender import recommend_locations
 from foot_traffic import (
     analyze_foot_traffic,
     estimate_target_customers,
@@ -120,7 +121,10 @@ SYSTEM_PROMPT = (
     "O~O명(전환율 1~4% 가정)' 형태로 반드시 숫자를 제시하세요. 이 숫자는 유동인구 분기합계를 "
     "하루로 나누고 방문 전환율을 가정한 추정치라는 점을 한 줄로 짧게 밝히세요.\n"
     "6) 필요하다면 임대료 조정안(할인/인센티브)이나 업종 전환 시나리오도 제안\n"
-    "7) 사용자가 특정 건물 주소를 주면서 그 건물 자체를 물어보면 analyze_building 도구도 "
+)
+
+FORMAT_RULES = (
+    "공통) 사용자가 특정 건물 주소를 주면서 그 건물 자체를 물어보면 analyze_building 도구도 "
     "함께 호출하세요. 이 도구 결과(연면적, 대지면적, 건폐율/용적률, 지상·지하 층수, 승강기 수, "
     "준공일, 주용도, 구조)가 있으면 답변에 반드시 반영하고, error가 있으면 '이 주소는 건축물대장 "
     "조회에 실패했다'고 명확히 밝히세요. 이 도구는 상권/유동인구 분석과는 별개이므로, 상권 질문과 "
@@ -140,6 +144,40 @@ SYSTEM_PROMPT = (
     "전체 답변은 각 항목을 핵심 위주로 간결하게 정리하고, 불필요하게 늘어지지 않게 하세요 "
     "(응답 길이 제한으로 문장이 중간에 잘리는 것을 방지하기 위함입니다)."
 )
+
+SYSTEM_PROMPT_LANDLORD = SYSTEM_PROMPT + FORMAT_RULES
+
+SYSTEM_PROMPT_FOUNDER = (
+    "당신은 처음 가게를 열려는 개인 예비 창업자를 돕는 친절한 상권 분석 상담가입니다. "
+    "사용자는 상권 분석이나 부동산 용어를 잘 모르는 일반인이라고 생각하고, 전문용어를 쓰면 "
+    "괄호로 쉽게 풀어서 설명하세요. 말투는 존댓말로 따뜻하지만 군더더기 없이, 결론을 먼저 말하세요. "
+    "숫자는 모두 공공데이터 기반 추정치이므로 '확정'처럼 말하지 말고, 그렇다고 겁을 주지도 마세요.\n\n"
+    "질문 유형별로 다음처럼 도구를 쓰세요.\n"
+    "A) '이 위치(주소/역)에서 뭘 하면 좋을까?' 같은 위치 기반 질문: analyze_trade_area와 "
+    "analyze_foot_traffic을 함께 호출하세요. 그 다음 demand_based_recommendations의 gap_score 상위 "
+    "업종 중 2~3개를 골라 각각 estimate_target_customers를 호출해 업종별 관심고객 수를 구하세요. "
+    "답변은 ① 이 동네 한 줄 요약(누가, 언제 오는 곳인지) ② 추천 업종 표(업종, 추천 이유 한 문장, "
+    "하루 관심고객 수, 예상 방문객 범위, 현재 경쟁 정도) ③ 피해야 할 업종(폐업률이 높은 업종) 순서로 쓰세요.\n"
+    "B) '카페 하고 싶은데 어디가 좋을까?' 같은 업종 기반 질문: recommend_locations_for_business를 "
+    "호출하세요. 사용자가 원하는 지역(구)을 말했으면 gu에 넣으세요. 답변은 상위 5곳 표(순위, 상권명, "
+    "자치구, 점수, 점포당 추정매출, 점포 수, 폐업률, 하루 유동인구)와 각 상권을 추천하는 이유 한 문장, "
+    "그리고 업종_점포당_추정매출_중앙값과 비교해 상위 상권이 얼마나 더 버는지 짚어주세요. "
+    "점수가 높아도 점포당 매출이 높은 곳은 보통 임대료도 비싸다는 점을 한 줄로 알려주세요. "
+    "결과의 error에 선택_가능한_업종 목록이 있으면 그중 가장 가까운 업종으로 다시 호출하세요. "
+    "1위 상권에 대해서는 analyze_foot_traffic을 추가로 호출해 언제 사람이 많은지도 짧게 설명하면 좋습니다.\n"
+    "C) 특정 매물(보증금, 월세, 평수)을 주며 수익을 묻는 질문: 아직 정식 수익 계산 기능은 준비 중입니다. "
+    "estimate_shop_rent와 estimate_target_customers 결과로 대략적인 매출 대비 임대료 부담만 알려주고, "
+    "'정밀 수익 예측은 곧 추가될 예정'이라고 한 줄로 안내하세요.\n\n"
+    "도구 결과 해석 원칙:\n"
+    "- estimate_target_customers 결과는 '하루 관심고객 약 O명, 하루 예상 방문객 O~O명(전환율 1~4% 가정)'처럼 "
+    "반드시 숫자로 말하세요.\n"
+    "- analyze_foot_traffic 결과로 평일형/주말형, 출근 도착형/퇴근 귀가형 같은 동네 성격을 쉬운 말로 설명하세요.\n"
+    "- 폐업률 표본(점포 수)이 3개 미만이면 신뢰도가 낮다고 짧게 밝히세요.\n"
+    "- 답변 마지막에는 '직접 확인해 볼 것' 체크리스트를 2~3개 주세요 "
+    "(예: 평일 점심·주말 저녁에 현장에 가서 사람 흐름 보기, 주변 같은 업종 가게 손님 수 세어보기, "
+    "실제 임대료 시세 부동산에 물어보기).\n"
+    "- 임대인(건물주) 입장의 말투나 '임차인 유치' 같은 표현은 쓰지 마세요.\n\n"
+) + FORMAT_RULES
 
 
 
@@ -278,6 +316,28 @@ TOOLS += [
 ]
 
 
+TOOLS.append({
+    "name": "recommend_locations_for_business",
+    "description": (
+        "창업하려는 업종 하나를 받아서, 서울 전체(또는 지정한 자치구) 상권 중 그 업종을 하기 좋은 곳을 "
+        "점수 순으로 추천한다. 점수는 점포당 추정매출(45%), 주 고객층에 맞는 하루 유동인구(30%), "
+        "낮은 폐업률(25%)로 계산한다. '카페 하려면 어디가 좋아?', '마포구에서 치킨집 하기 좋은 곳' 같은 "
+        "업종 기반 위치 질문에 사용한다. 처음 호출할 때는 서울 전체 데이터를 불러와서 30초 정도 걸릴 수 있다."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "business": {"type": "string", "description": "업종 (예: '카페', '치킨', '미용실', '커피-음료')"},
+            "gu": {"type": "string", "description": "범위를 좁힐 자치구. 여러 개면 쉼표로 (예: '마포구, 서대문구'). 없으면 서울 전체"},
+            "target_ages": {"type": "array", "items": {"type": "string", "enum": AGE_ENUM},
+                            "description": "사용자가 주 고객 연령대를 말한 경우에만 넣는다"},
+            "top_n": {"type": "integer", "description": "추천 개수 (기본 10)"},
+        },
+        "required": ["business"],
+    },
+})
+
+
 def resolve_trade_area(keyword, address):
     """키워드/주소 -> (상권코드, 상권명, 좌표). analyze_single_area보다 가벼운 버전."""
     geo = None
@@ -356,6 +416,14 @@ def run_tool(tool_name, tool_input):
 
     if tool_name == "analyze_building":
         return get_building_info(tool_input["address"])
+
+    if tool_name == "recommend_locations_for_business":
+        return recommend_locations(
+            tool_input["business"],
+            gu=tool_input.get("gu"),
+            top_n=tool_input.get("top_n") or 10,
+            target_ages=tool_input.get("target_ages"),
+        )
 
     if tool_name in ("analyze_foot_traffic", "estimate_target_customers"):
         primary, geo = resolve_trade_area(tool_input.get("keyword"), tool_input.get("address"))
@@ -472,6 +540,14 @@ def build_charts_from_tool_call(tool_name, result):
                     "data": trend_data,
                     "type": "line",
                 })
+
+    if tool_name == "recommend_locations_for_business":
+        top = (result.get("추천_상권") or [])[:7]
+        if top:
+            charts.append({
+                "title": (result.get("업종") or "") + " - 추천 상권 점포당 추정매출(만원)",
+                "data": {str(i + 1) + ". " + str(c["상권명"]): c["점포당_추정매출_만원"] for i, c in enumerate(top)},
+            })
 
     if tool_name == "analyze_foot_traffic":
         area_name = result.get("trdar_cd_nm") or result.get("keyword") or ""
@@ -720,6 +796,8 @@ def describe_tool_call(tool_name, tool_input):
         return "🔍 '" + tool_input.get("keyword", "") + "' 상권 분석 중"
     if tool_name == "estimate_shop_rent":
         return "💰 '" + tool_input.get("keyword", "") + "' 임대료 계산 중"
+    if tool_name == "recommend_locations_for_business":
+        return "🗺️ '" + tool_input.get("business", "") + "' 하기 좋은 상권 찾는 중"
     if tool_name == "analyze_foot_traffic":
         return "🚶 '" + tool_input.get("keyword", "") + "' 인적 동선 분석 중"
     if tool_name == "estimate_target_customers":
@@ -738,7 +816,7 @@ def get_claude_response(client, messages):
         response = client.messages.create(
             model=MODEL_NAME,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            system=st.session_state.get("system_prompt", SYSTEM_PROMPT_FOUNDER),
             tools=TOOLS,
             messages=messages,
         )
@@ -767,6 +845,9 @@ def get_claude_response(client, messages):
                     st.write("📍 위치(좌표) 확인 중...")
                     st.write("📊 유동인구 · 업종 데이터 조회 중... (병렬 처리)")
                     st.write("💰 인근 매매가/임대료 시세 조회 중... (병렬 처리)")
+                elif tool_use.name == "recommend_locations_for_business":
+                    st.write("📥 서울 전체 상권의 매출·점포·유동인구 데이터 불러오는 중... (처음 한 번은 30초쯤 걸려요)")
+                    st.write("🧮 점포당 매출 · 관심 유동인구 · 폐업률로 순위 매기는 중...")
                 elif tool_use.name == "estimate_shop_rent":
                     st.write("📍 상권 데이터 확인 중...")
                     st.write("💰 매매실거래가 조회 중...")
@@ -821,8 +902,27 @@ def main():
         unsafe_allow_html=True,
     )
 
-    st.title("🏢 서울시 상권 분석 AI ChatBot")
-    st.caption("궁금한 상권의 유동인구, 업종 분포, 추천 임대료를 물어보세요.")
+    with st.sidebar:
+        mode = st.radio(
+            "누가 쓰나요?",
+            ["🧑‍🍳 창업자 (가게를 열고 싶어요)", "🏢 임대인 (상가를 채우고 싶어요)"],
+            key="user_mode",
+        )
+    is_founder = mode.startswith("🧑‍🍳")
+    st.session_state.system_prompt = SYSTEM_PROMPT_FOUNDER if is_founder else SYSTEM_PROMPT_LANDLORD
+
+    # 모드를 바꾸면 이전 대화가 다른 말투로 이어지지 않도록 대화를 새로 시작한다
+    if st.session_state.get("last_mode") not in (None, mode):
+        st.session_state.display_messages = []
+        st.session_state.api_messages = []
+    st.session_state.last_mode = mode
+
+    if is_founder:
+        st.title("🧑‍🍳 서울 창업 입지 AI")
+        st.caption("어디에, 무엇을 열면 좋을지 공공데이터로 같이 따져봐요.")
+    else:
+        st.title("🏢 서울시 상권 분석 AI ChatBot")
+        st.caption("궁금한 상권의 유동인구, 업종 분포, 추천 임대료를 물어보세요.")
 
     if not ANTHROPIC_API_KEY:
         st.error("ANTHROPIC_API_KEY가 설정되지 않았습니다. .env 또는 Streamlit secrets를 확인하세요.")
@@ -837,113 +937,114 @@ def main():
                 with st.spinner("API 확인 중..."):
                     st.json(inspect_new_apis())
 
-        st.header("📐 도면 기반 호실별 분석")
+        if not is_founder:
+            st.header("📐 도면 기반 호실별 분석")
 
-        uploaded_file = st.file_uploader("상가 도면 이미지 업로드", type=["png", "jpg", "jpeg"])
-        keyword = st.text_input("상권 키워드 (예: OO역)", key="floor_keyword")
-        address = st.text_input("지오코딩 주소 (예: 서울특별시 OO구 OO동)", key="floor_address")
-        lawd_cd = st.text_input("법정동코드 5자리", value="11230", key="floor_lawd")
-        deal_ym = st.text_input("매매실거래가 계약년월 6자리", value="202412", key="floor_deal_ym")
+            uploaded_file = st.file_uploader("상가 도면 이미지 업로드", type=["png", "jpg", "jpeg"])
+            keyword = st.text_input("상권 키워드 (예: OO역)", key="floor_keyword")
+            address = st.text_input("지오코딩 주소 (예: 서울특별시 OO구 OO동)", key="floor_address")
+            lawd_cd = st.text_input("법정동코드 5자리", value="11230", key="floor_lawd")
+            deal_ym = st.text_input("매매실거래가 계약년월 6자리", value="202412", key="floor_deal_ym")
 
-        if st.button("호실 목록 초기화"):
-            st.session_state.extracted_rooms = []
-            st.session_state.room_price_results = []
-
-        if uploaded_file and st.button("1단계: 호실 목록 추출 (현재 업로드된 층 추가)"):
-            file_bytes = uploaded_file.getvalue()
-            media_type = uploaded_file.type
-            with st.spinner("도면에서 호실 읽는 중..."):
-                new_rooms, floor_summary = extract_rooms_from_image(client, file_bytes, media_type)
-
-            if "extracted_rooms" not in st.session_state:
+            if st.button("호실 목록 초기화"):
                 st.session_state.extracted_rooms = []
+                st.session_state.room_price_results = []
 
-            existing_keys = {(r.get("room_name"), r.get("floor")) for r in st.session_state.extracted_rooms}
-            for r in new_rooms:
-                key = (r.get("room_name"), r.get("floor"))
-                if key not in existing_keys:
-                    st.session_state.extracted_rooms.append(r)
-                    existing_keys.add(key)
+            if uploaded_file and st.button("1단계: 호실 목록 추출 (현재 업로드된 층 추가)"):
+                file_bytes = uploaded_file.getvalue()
+                media_type = uploaded_file.type
+                with st.spinner("도면에서 호실 읽는 중..."):
+                    new_rooms, floor_summary = extract_rooms_from_image(client, file_bytes, media_type)
 
-            if floor_summary and floor_summary.get("avg_pyeong"):
-                st.info(
-                    (floor_summary.get("floor_label") or "이 층") + ": "
-                    + str(floor_summary.get("total_room_count")) + "개 호실, "
-                    + "전체 " + str(floor_summary.get("total_area_pyeong")) + "평 "
-                    + "→ 평균 " + str(floor_summary.get("avg_pyeong")) + "평/호실로 기본 반영됨"
-                )
+                if "extracted_rooms" not in st.session_state:
+                    st.session_state.extracted_rooms = []
 
-        if st.session_state.get("extracted_rooms"):
-            st.write("추출된 호실 목록 - 평수는 층 평균값이 기본으로 채워져 있어요. 필요시 직접 수정하세요.")
-            rooms_df = pd.DataFrame(st.session_state.extracted_rooms)
-            if "평수" not in rooms_df.columns:
-                rooms_df["평수"] = 10.0
+                existing_keys = {(r.get("room_name"), r.get("floor")) for r in st.session_state.extracted_rooms}
+                for r in new_rooms:
+                    key = (r.get("room_name"), r.get("floor"))
+                    if key not in existing_keys:
+                        st.session_state.extracted_rooms.append(r)
+                        existing_keys.add(key)
 
-            edited_df = st.data_editor(rooms_df, num_rows="dynamic", key="rooms_editor")
+                if floor_summary and floor_summary.get("avg_pyeong"):
+                    st.info(
+                        (floor_summary.get("floor_label") or "이 층") + ": "
+                        + str(floor_summary.get("total_room_count")) + "개 호실, "
+                        + "전체 " + str(floor_summary.get("total_area_pyeong")) + "평 "
+                        + "→ 평균 " + str(floor_summary.get("avg_pyeong")) + "평/호실로 기본 반영됨"
+                    )
 
-            if st.button("2단계: 업종 추천 + 임대료 계산"):
-                if not keyword or not address:
-                    st.warning("상권 키워드와 주소를 입력해주세요.")
-                else:
-                    with st.spinner("상권 데이터 조회 중..."):
-                        area_result = analyze_single_area(keyword, address)
+            if st.session_state.get("extracted_rooms"):
+                st.write("추출된 호실 목록 - 평수는 층 평균값이 기본으로 채워져 있어요. 필요시 직접 수정하세요.")
+                rooms_df = pd.DataFrame(st.session_state.extracted_rooms)
+                if "평수" not in rooms_df.columns:
+                    rooms_df["평수"] = 10.0
 
-                    if area_result["error"]:
-                        st.error(area_result["error"])
+                edited_df = st.data_editor(rooms_df, num_rows="dynamic", key="rooms_editor")
+
+                if st.button("2단계: 업종 추천 + 임대료 계산"):
+                    if not keyword or not address:
+                        st.warning("상권 키워드와 주소를 입력해주세요.")
                     else:
-                        rooms_list = edited_df.to_dict("records")
-                        with st.spinner("호실별 업종 추천 중..."):
-                            recommendations = recommend_categories_for_rooms(client, rooms_list, area_result)
+                        with st.spinner("상권 데이터 조회 중..."):
+                            area_result = analyze_single_area(keyword, address)
 
-                        sale_items = get_commercial_sale_prices(lawd_cd, deal_ym)
-                        price_per_pyeong = estimate_price_per_pyeong(sale_items)
+                        if area_result["error"]:
+                            st.error(area_result["error"])
+                        else:
+                            rooms_list = edited_df.to_dict("records")
+                            with st.spinner("호실별 업종 추천 중..."):
+                                recommendations = recommend_categories_for_rooms(client, rooms_list, area_result)
 
-                        result_rows = []
-                        for rec in recommendations:
-                            room_name = rec.get("room_name")
-                            floor = rec.get("floor", "")
-                            category = rec.get("recommended_category", "")
-                            hours = rec.get("business_hours", [])
-                            reasoning = rec.get("reasoning", "")
+                            sale_items = get_commercial_sale_prices(lawd_cd, deal_ym)
+                            price_per_pyeong = estimate_price_per_pyeong(sale_items)
 
-                            area_pyeong = 10.0
-                            if "room_name" in edited_df.columns:
-                                match_row = edited_df[edited_df["room_name"] == room_name]
-                                if not match_row.empty and "평수" in match_row.columns:
-                                    area_pyeong = float(match_row.iloc[0]["평수"])
+                            result_rows = []
+                            for rec in recommendations:
+                                room_name = rec.get("room_name")
+                                floor = rec.get("floor", "")
+                                category = rec.get("recommended_category", "")
+                                hours = rec.get("business_hours", [])
+                                reasoning = rec.get("reasoning", "")
 
-                            floor_weight = floor_weight_from_label(floor)
+                                area_pyeong = 10.0
+                                if "room_name" in edited_df.columns:
+                                    match_row = edited_df[edited_df["room_name"] == room_name]
+                                    if not match_row.empty and "평수" in match_row.columns:
+                                        area_pyeong = float(match_row.iloc[0]["평수"])
 
-                            monthly_rent = None
-                            if price_per_pyeong is not None:
-                                rent_result = estimate_rent(
-                                    base_price_per_pyeong=price_per_pyeong,
-                                    area_pyeong=area_pyeong,
-                                    pop_summary=area_result["population"],
-                                    store_breakdown=area_result["store_breakdown"],
-                                    business_hours=hours,
-                                    category_name=category,
-                                    category_level="mid",
-                                    cap_rate=0.05,
-                                    floor_weight=floor_weight,
-                                )
-                                monthly_rent = rent_result["최종_추천_월임대료_만원"]
+                                floor_weight = floor_weight_from_label(floor)
 
-                            result_rows.append({
-                                "호실": room_name,
-                                "층": floor,
-                                "평수": area_pyeong,
-                                "추천업종": category,
-                                "추천월임대료(만원)": monthly_rent,
-                                "추천이유": reasoning,
-                            })
+                                monthly_rent = None
+                                if price_per_pyeong is not None:
+                                    rent_result = estimate_rent(
+                                        base_price_per_pyeong=price_per_pyeong,
+                                        area_pyeong=area_pyeong,
+                                        pop_summary=area_result["population"],
+                                        store_breakdown=area_result["store_breakdown"],
+                                        business_hours=hours,
+                                        category_name=category,
+                                        category_level="mid",
+                                        cap_rate=0.05,
+                                        floor_weight=floor_weight,
+                                    )
+                                    monthly_rent = rent_result["최종_추천_월임대료_만원"]
 
-                        st.session_state.room_price_results = result_rows
+                                result_rows.append({
+                                    "호실": room_name,
+                                    "층": floor,
+                                    "평수": area_pyeong,
+                                    "추천업종": category,
+                                    "추천월임대료(만원)": monthly_rent,
+                                    "추천이유": reasoning,
+                                })
 
-        if st.session_state.get("room_price_results"):
-            st.subheader("호실별 추천 결과")
-            result_df = pd.DataFrame(st.session_state.room_price_results)
-            st.dataframe(result_df, use_container_width=True)
+                            st.session_state.room_price_results = result_rows
+
+            if st.session_state.get("room_price_results"):
+                st.subheader("호실별 추천 결과")
+                result_df = pd.DataFrame(st.session_state.room_price_results)
+                st.dataframe(result_df, use_container_width=True)
 
     if "display_messages" not in st.session_state:
         st.session_state.display_messages = []
@@ -958,7 +1059,23 @@ def main():
             if msg.get("map_info"):
                 render_naver_map(msg["map_info"]["lat"], msg["map_info"]["lng"], msg["map_info"]["title"])
 
-    user_input = st.chat_input("예: OO역 상권은 어때?")
+    examples = []
+    if is_founder and not st.session_state.display_messages and "pending_question" not in st.session_state:
+        st.write("**이렇게 물어보세요** (눌러서 바로 질문)")
+        examples = [
+            "망원역 근처에서 무슨 가게를 하면 좋을까?",
+            "카페를 하고 싶은데 서울에서 어디가 좋을까?",
+            "마포구에서 20~30대 여성 대상 네일숍 하기 좋은 곳 추천해줘",
+            "청량리역에 치킨집 열면 하루 손님 몇 명쯤 올까?",
+        ]
+        cols = st.columns(2)
+        for i, q in enumerate(examples):
+            if cols[i % 2].button(q, key="ex_" + str(i), use_container_width=True):
+                st.session_state.pending_question = q
+                st.rerun()
+
+    placeholder = "예: 카페 하려면 어디가 좋아?" if is_founder else "예: OO역 상권은 어때?"
+    user_input = st.chat_input(placeholder) or st.session_state.pop("pending_question", None)
 
     if user_input:
         st.session_state.display_messages.append({"role": "user", "content": user_input, "charts": []})
@@ -989,6 +1106,10 @@ def main():
             map_info = None
             for record in tool_call_records:
                 all_charts.extend(build_charts_from_tool_call(record["name"], record["result"]))
+                if record["name"] == "recommend_locations_for_business":
+                    top = (record["result"].get("추천_상권") or [None])[0]
+                    if top and top.get("lat") and top.get("lng") and not map_info:
+                        map_info = {"lat": top["lat"], "lng": top["lng"], "title": "추천 1위: " + str(top["상권명"])}
                 if record["name"] in ("analyze_trade_area", "analyze_foot_traffic", "estimate_target_customers"):
                     geo = record["result"].get("geo")
                     if geo and geo.get("lat") and geo.get("lng"):
