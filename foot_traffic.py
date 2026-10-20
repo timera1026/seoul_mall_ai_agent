@@ -573,16 +573,13 @@ def inspect_new_apis():
         from location_recommender import recommend_locations
         from compare_trade_area import CONFIG
         rec = recommend_locations("커피-음료", top_n=1)
-        median = rec.get("업종_점포당_월_추정매출_중앙값_만원")
-        if median is not None:
-            report["매출단위_점검_카페"] = {
-                "점포당_원본값_중앙값_만원": median * CONFIG["SALES_AMT_MONTHS"],
-                "점포당_월환산_중앙값_만원": median,
-                "현재_나누는_값": CONFIG["SALES_AMT_MONTHS"],
-                "비교한_상권_수": rec.get("비교한_상권_수"),
-            }
-        else:
-            report["매출단위_점검_카페"] = rec.get("error")
+        report["매출단위_점검_카페"] = {
+            "서울시_원자료_점포당_중앙값_만원": rec.get("서울시_원자료_점포당_중앙값_만원"),
+            "현재_나누는_값": CONFIG["SALES_AMT_MONTHS"],
+            "업종_표준_월매출_만원": rec.get("업종_표준_월매출_만원(서울 평균 점포 가정)"),
+            "비교한_상권_수": rec.get("비교한_상권_수"),
+            "error": rec.get("error"),
+        }
     except Exception as e:
         report["매출단위_점검_카페"] = "확인 실패: " + str(e)
     return report

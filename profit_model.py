@@ -5,8 +5,8 @@
 
 계산 순서
   1) 예상 월매출
-     - 방법 1 (주 계산): 이 상권에서 같은 업종 가게 하나의 평균 월매출 (서울시 추정매출 ÷ 점포 수)
-                          × 층수 보정 × 면적 보정
+     - 방법 1 (주 계산): 업종 표준 월매출 × 이 상권의 '서울 평균 대비 매출 지수' × 층수·면적 보정
+                          (지수 = 이 상권 점포당 카드매출 ÷ 서울 전체 점포당 카드매출 중앙값)
      - 방법 2 (검산용): 하루 예상 방문객 × 객단가(결제 1건당 평균 금액) × 한 달 영업일
      - 보수(평균의 70%) / 보통(100%) /낙관(120%) 세 가지 시나리오
        (새 가게는 첫해에 동네 평균보다 못 버는 경우가 많아서 보수 시나리오를 함께 본다)
@@ -25,6 +25,7 @@ from foot_traffic import (
 )
 from location_recommender import (
     resolve_business, _load_sales_and_stores, get_trade_area_meta, DEMAND_PROFILE_MAP, _num,
+    per_store_table, calibrated_sales, BENCHMARK_MONTHLY_SALES, DEFAULT_BENCHMARK, MIN_STORES,
 )
 
 # 업종별 비용 구조 (매출 대비 비율) + 초기 투자 기준값(만원)
@@ -189,38 +190,32 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
         return {"error": "'" + str(business) + "' 업종을 서울시 업종 목록에서 찾지 못했습니다.",
                 "선택_가능한_업종": sorted(names)}
 
-    months = CONFIG["SALES_AMT_MONTHS"]
     meta = get_trade_area_meta()
     trdar_cd = str(trdar_cd)
     gu = (meta.get(trdar_cd) or {}).get("자치구")
-    store_cnt = {str(r.get("TRDAR_CD")): (_num(r.get("STOR_CO")) or _num(r.get("SIMILR_INDUTY_STOR_CO")))
-                 for r in stores if r.get("SVC_INDUTY_CD_NM") == svc}
-
-    # 이 업종의 상권별 (점포당 월매출, 객단가)
-    per_store, tickets = {}, {}
-    for r in sales:
-        if r.get("SVC_INDUTY_CD_NM") != svc:
-            continue
-        cd = str(r.get("TRDAR_CD"))
-        amt, cnt, n = _num(r.get("THSMON_SELNG_AMT")), _num(r.get("THSMON_SELNG_CO")), store_cnt.get(cd)
-        if amt and n:
-            per_store[cd] = amt / months / n / 10000
-        if amt and cnt:
-            tickets[cd] = amt / cnt
+    table, seoul_median = per_store_table(svc, sales, stores)
+    bench = BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK)
 
     def _median(vals):
         vals = sorted(v for v in vals if v)
         return vals[len(vals) // 2] if vals else None
 
-    if trdar_cd in per_store:
-        base_raw, source = per_store[trdar_cd], "이 상권의 같은 업종 점포 평균 (점포 " + str(int(store_cnt[trdar_cd])) + "곳)"
+    # 이 상권의 '서울 평균 대비 매출 지수'. 점포가 너무 적으면 같은 구 상권들의 중앙값을 쓴다.
+    here = table.get(trdar_cd) or {}
+    if here.get("raw") and (here.get("n") or 0) >= MIN_STORES:
+        raw = here["raw"]
+        source = "이 상권의 같은 업종 점포 평균 (점포 " + str(int(here["n"])) + "곳)"
     else:
-        same_gu = [v for cd, v in per_store.items() if gu and (meta.get(cd) or {}).get("자치구") == gu]
+        same_gu = [v["raw"] for cd, v in table.items()
+                   if gu and (meta.get(cd) or {}).get("자치구") == gu and (v["n"] or 0) >= MIN_STORES]
         if same_gu:
-            base_raw, source = _median(same_gu), gu + " 같은 업종 점포 중앙값 (이 상권에는 같은 업종 데이터 없음)"
+            raw = _median(same_gu)
+            source = gu + " 같은 업종 상권들의 중앙값 (이 상권은 같은 업종 점포가 " + str(MIN_STORES) + "곳 미만)"
         else:
-            base_raw, source = _median(per_store.values()), "서울 전체 같은 업종 점포 중앙값"
-    ticket = tickets.get(trdar_cd) or _median(tickets.values())
+            raw = seoul_median
+            source = "서울 전체 같은 업종 중앙값"
+    idx, base_raw = calibrated_sales(svc, raw, seoul_median)
+    ticket = here.get("ticket") or _median(v["ticket"] for v in table.values())
 
     ff, sf = floor_factor(floor, svc), size_factor(area_pyeong, svc)
     base_sales = base_raw * ff * sf if base_raw else None
@@ -256,6 +251,8 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
         "매출_기준": source,
         "매출_기준_분기": sales_q,
         "매출_보정": {
+            "업종_표준_월매출_만원": bench,
+            "서울평균_대비_매출지수": idx,
             "동네_평균_점포_월매출_만원": round(base_raw) if base_raw else None,
             "층수_보정": round(ff, 2), "면적_보정": round(sf, 2),
             "표준평수": COST_PROFILES.get(svc, DEFAULT_COST)["표준평수"],
@@ -263,7 +260,7 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
         "검산_관심고객_기준": visitors_check,
         "매물": {"평수": area_pyeong, "층": floor, "보증금_만원": deposit, "월세_만원": monthly_rent,
                "관리비_만원": result["가정값"]["관리비_만원"], "권리금_만원": premium},
-        "주의": "공공데이터 기반 추정치. 세금(부가세·소득세)과 사장 본인 인건비는 빠져 있고, "
+        "주의": "동네 매출 수준은 서울시 카드매출 데이터의 상대 비교로, 금액 수준은 업종 표준 매출(가정값)로 정함. 세금(부가세·소득세)과 사장 본인 인건비는 빠져 있고, "
                "가맹점이면 로열티·물류비가 추가될 수 있음",
     })
     return result

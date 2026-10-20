@@ -57,6 +57,56 @@ DEMAND_PROFILE_MAP = {
     "노래방": "유원지·오락", "PC방": "유원지·오락",
 }
 
+# 업종별 '보통 개인 점포'의 월 매출 기준값(만원).
+# 서울시 추정매출 원자료는 카드매출 기반이라 실제보다 낮게 나오는 경향이 있어서(2026-10 점검 시
+# 카페 점포당 중앙값 약 318만원), 금액은 이 기준값을 쓰고 서울시 데이터는 '서울 평균 대비 몇 배인지'
+# (상대 지수)로만 쓴다. 기준값은 공정위 가맹사업 통계(외식 가맹점 연평균 약 2.8억원)보다 개인 점포 수준으로
+# 낮춰 잡은 가정값이며, 실제 사례를 알게 되면 여기만 고치면 전체 계산에 반영된다.
+BENCHMARK_MONTHLY_SALES = {
+    "커피-음료": 1500, "한식음식점": 2500, "중식음식점": 2500, "일식음식점": 2500, "양식음식점": 2500,
+    "분식전문점": 1500, "패스트푸드점": 3000, "치킨전문점": 2000, "제과점": 2000, "호프-간이주점": 2000,
+    "미용실": 1200, "네일숍": 600, "피부관리실": 800, "편의점": 4500, "일반교습학원": 1500,
+}
+DEFAULT_BENCHMARK = 1800
+INDEX_MIN, INDEX_MAX = 0.4, 2.5  # 극단값 방지 (평균의 0.4배 ~ 2.5배)
+
+
+def per_store_table(svc, sales, stores):
+    """
+    업종 svc의 상권별 {점포당 원자료 월매출(만원), 점포 수, 객단가(원)}와 서울 중앙값.
+    점포 수는 프랜차이즈 포함 전체(유사업종 점포수)를 쓴다 (매출에도 프랜차이즈가 포함되므로).
+    """
+    months = CONFIG["SALES_AMT_MONTHS"]
+    n_by_cd = {}
+    for r in stores:
+        if r.get("SVC_INDUTY_CD_NM") == svc:
+            n_by_cd[str(r.get("TRDAR_CD"))] = (r, _num(r.get("SIMILR_INDUTY_STOR_CO")) or _num(r.get("STOR_CO")))
+    table = {}
+    for r in sales:
+        if r.get("SVC_INDUTY_CD_NM") != svc:
+            continue
+        cd = str(r.get("TRDAR_CD"))
+        amt, cnt = _num(r.get("THSMON_SELNG_AMT")), _num(r.get("THSMON_SELNG_CO"))
+        st_row, n = n_by_cd.get(cd, ({}, None))
+        table[cd] = {
+            "raw": (amt / months / n / 10000) if (amt and n) else None,
+            "n": n, "store_row": st_row,
+            "ticket": (amt / cnt) if (amt and cnt) else None,
+        }
+    reliable = sorted(v["raw"] for v in table.values() if v["raw"] and (v["n"] or 0) >= MIN_STORES)
+    median = reliable[len(reliable) // 2] if reliable else None
+    return table, median
+
+
+def calibrated_sales(svc, raw, seoul_median):
+    """원자료 점포당 매출 -> (서울 평균 대비 지수, 업종 기준값을 곱한 월매출 추정 만원)."""
+    bench = BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK)
+    if not raw or not seoul_median:
+        return None, None
+    idx = max(INDEX_MIN, min(INDEX_MAX, raw / seoul_median))
+    return round(idx, 2), round(bench * idx)
+
+
 SALES_FIELDS = ["STDR_YYQU_CD", "TRDAR_CD", "TRDAR_CD_NM", "SVC_INDUTY_CD_NM",
                 "THSMON_SELNG_AMT", "THSMON_SELNG_CO"]
 STORE_FIELDS = ["STDR_YYQU_CD", "TRDAR_CD", "SVC_INDUTY_CD_NM", "STOR_CO",
@@ -162,28 +212,22 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
 
     flpop_rows, flpop_q, _ = load_quarter_table("VwsmTrdarFlpopQq", std_ym)
     flpop_by_cd = {str(r.get("TRDAR_CD")): r for r in flpop_rows}
-    store_by_cd = {str(r.get("TRDAR_CD")): r for r in stores if r.get("SVC_INDUTY_CD_NM") == svc}
+    table, seoul_median = per_store_table(svc, sales, stores)
     meta = get_trade_area_meta()
     profile_key = DEMAND_PROFILE_MAP.get(svc)
 
     gu_filter = [g.strip() for g in (gu or "").replace("/", ",").split(",") if g.strip()]
 
     candidates = []
-    for r in sales:
-        if r.get("SVC_INDUTY_CD_NM") != svc:
-            continue
-        cd = str(r.get("TRDAR_CD"))
+    for cd, row in table.items():
         info = meta.get(cd, {})
         if gu_filter and not any(g.replace("구", "") in (info.get("자치구") or "") for g in gu_filter):
             continue
-
-        amt = _num(r.get("THSMON_SELNG_AMT"))
-        if amt:
-            amt = amt / CONFIG["SALES_AMT_MONTHS"]  # 분기 합계 -> 월 매출
-        st = store_by_cd.get(cd) or {}
-        n_store = _num(st.get("STOR_CO")) or _num(st.get("SIMILR_INDUTY_STOR_CO"))
-        if not amt or not n_store or n_store < MIN_STORES:
+        n_store, raw = row["n"], row["raw"]
+        if not raw or not n_store or n_store < MIN_STORES:
             continue
+        st = row["store_row"] or {}
+        idx, est = calibrated_sales(svc, raw, seoul_median)
 
         fl = flpop_by_cd.get(cd)
         pop = {k: _num(v) for k, v in summarize_population([fl]).items()} if fl else {}
@@ -199,15 +243,16 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
 
         candidates.append({
             "trdar_cd": cd,
-            "상권명": info.get("상권명") or r.get("TRDAR_CD_NM"),
+            "상권명": info.get("상권명"),
             "상권구분": info.get("상권구분"),
             "자치구": info.get("자치구"),
             "행정동": info.get("행정동"),
             "lat": info.get("lat"), "lng": info.get("lng"),
             "점포수": int(n_store),
             "프랜차이즈_점포수": int(_num(st.get("FRC_STOR_CO")) or 0),
-            "점포당_월_추정매출_만원": round(amt / n_store / 10000),
-            "업종_전체_월_추정매출_만원": round(amt / 10000),
+            "서울평균_대비_매출지수": idx,
+            "점포당_월매출_추정_만원": est,
+            "객단가_원": round(row["ticket"]) if row["ticket"] else None,
             "폐업률": _num(st.get("CLSBIZ_RT")),
             "개업률": _num(st.get("OPBIZ_RT")),
             "하루_유동인구": round(daily) if daily else None,
@@ -219,7 +264,7 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         return {"error": "조건에 맞는 상권이 없습니다" + where + ". 점포가 " + str(MIN_STORES)
                          + "곳 이상인 상권만 비교하기 때문에, 범위를 넓혀 보세요.", "업종": svc}
 
-    pr_sales = _percentile_ranks([c["점포당_월_추정매출_만원"] for c in candidates])
+    pr_sales = _percentile_ranks([c["서울평균_대비_매출지수"] for c in candidates])
     pr_traffic = _percentile_ranks([c["하루_관심_유동인구"] for c in candidates])
     pr_closure = _percentile_ranks([c["폐업률"] for c in candidates])
     for c, s, t, cl in zip(candidates, pr_sales, pr_traffic, pr_closure):
@@ -231,8 +276,6 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         }
 
     candidates.sort(key=lambda c: c["점수"], reverse=True)
-    per_store = sorted(c["점포당_월_추정매출_만원"] for c in candidates)
-    median = per_store[len(per_store) // 2]
 
     return {
         "업종": svc,
@@ -241,8 +284,9 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         "매출_기준_분기": sales_q,
         "유동인구_기준_분기": flpop_q,
         "비교한_상권_수": len(candidates),
-        "업종_점포당_월_추정매출_중앙값_만원": median,
+        "업종_표준_월매출_만원(서울 평균 점포 가정)": BENCHMARK_MONTHLY_SALES.get(svc, DEFAULT_BENCHMARK),
+        "서울시_원자료_점포당_중앙값_만원": round(seoul_median) if seoul_median else None,
         "추천_상권": candidates[:top_n],
-        "점수_계산법": "점포당 추정매출 45% + 관심 유동인구 30% + 낮은 폐업률 25% (각각 비교 상권 중 백분위)",
-        "참고": "추정매출은 카드매출 기반 추정치이며, 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외함",
+        "점수_계산법": "점포당 매출(서울 평균 대비) 45% + 관심 유동인구 30% + 낮은 폐업률 25% (각각 비교 상권 중 백분위)",
+        "참고": "점포당 월매출은 업종 표준 매출 × 서울 평균 대비 지수로 만든 추정치. 서울시 카드매출 원자료는 실제보다 낮게 나오는 경향이 있어 상대 비교에만 씀. 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외",
     }
