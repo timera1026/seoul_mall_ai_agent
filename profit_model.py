@@ -254,11 +254,12 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
     if pr:
         scenario_sales = {"보수": pr["하위10%"] * ff * sf, "보통": pr["중앙"] * ff * sf, "낙관": pr["상위10%"] * ff * sf}
         base_sales = scenario_sales["보통"]
-        source = ("매출 예측 모델" + pr["사용모델"] + " (같은 업종 " + str(pr["점포수_진입전"]) + "곳 → 내가 들어가면 "
+        source = ("매출 예측: " + pr["사용모델"] + " (같은 업종 " + str(pr["점포수_진입전"]) + "곳 → 내가 들어가면 "
                   + str(pr["점포수_진입후"]) + "곳 기준, 신뢰도 " + pr["신뢰도"] + ")")
         model_pred = {"점포당_월매출_예측_만원(층·면적 보정 전)": {k: pr[k] for k in ("하위10%", "중앙", "상위10%")},
                       "모델_검증": model_summary_for_user()}
-        scenario_meaning = "보수=예측 하위 10%, 보통=예측 중앙값, 낙관=예측 상위 10% (실제 값이 이 범위에 들어갈 확률 약 80%, 검증으로 보정)"
+        scenario_meaning = ("보수=예측 하위 10%, 보통=예측 중앙값, 낙관=예측 상위 10% (실제 서울시 데이터로 검증한 분기간 변동폭, "
+                            "실제 값이 이 범위에 들어갈 확률 약 80%)")
 
     if not base_sales:
         return {"error": "이 업종의 매출 데이터를 찾지 못해 수익을 계산할 수 없습니다.", "업종": svc}

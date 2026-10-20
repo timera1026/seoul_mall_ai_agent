@@ -35,7 +35,7 @@ from location_recommender import get_trade_area_meta, SALES_FIELDS, STORE_FIELDS
 QUANTILES = (0.1, 0.5, 0.9)
 COVERAGE = 0.8
 MODEL_TTL_SEC = 12 * 3600
-MODEL_PATH = os.path.join(tempfile.gettempdir(), "seoul_sales_model_v1.pkl")
+MODEL_PATH = os.path.join(tempfile.gettempdir(), "seoul_sales_model_v2.pkl")
 
 AGE_F = ["AGRDE_10_FLPOP_CO", "AGRDE_20_FLPOP_CO", "AGRDE_30_FLPOP_CO",
          "AGRDE_40_FLPOP_CO", "AGRDE_50_FLPOP_CO", "AGRDE_60_ABOVE_FLPOP_CO"]
@@ -323,13 +323,39 @@ def train_and_validate(inp):
         preds[te] = np.exp(_predict_log(models, train_Q.iloc[te], FEATS_B, categories, qhat.get("B", 0.0)))
     report["공간검증_모델B(처음보는상권)"] = _metrics(train_Q["per_store"], preds[:, 1], preds[:, 0], preds[:, 2])
 
-    # ③ 배포용: 최신 분기 전체로 다시 학습
-    final = {name: _fit(train_Q, feats, categories) for name, feats in (("A", FEATS_A), ("B", FEATS_B))}
+    # ④ 채택 방식 검증: '최근 2개 분기 실적 평균' (실제 데이터에서 ML 모델들보다 정확했음)
+    #    최신 분기(Q)를 Q-1, Q-2 실적만으로 맞혀 보고, 범위는 Q-1 분기의 분기간 변동폭으로 정한다.
+    hist = {"bucket_q": {}, "qhat": 0.0}
+    lag2 = frame_1[["TRDAR_CD", "svc", "lag_log"]].rename(columns={"lag_log": "lag2_log"})
+    hv = train_Q.merge(lag2, on=["TRDAR_CD", "svc"], how="left")
+    hv = hv[np.isfinite(hv["lag_log"])]
+    if len(hv) >= 300:
+        center = np.where(np.isfinite(hv["lag2_log"]), (hv["lag_log"] + hv["lag2_log"]) / 2, hv["lag_log"])
+        c1 = train_1[np.isfinite(train_1["lag_log"])]
+        ch_all = np.log(c1["per_store"].values) - c1["lag_log"].values
+        for b, mask in (("small", c1["n"].values <= 10), ("large", c1["n"].values > 10)):
+            ch = ch_all[mask] if mask.sum() >= 100 else ch_all
+            hist["bucket_q"][b] = (float(np.quantile(ch, 0.1)), float(np.quantile(ch, 0.9)))
+        bq = np.array([hist["bucket_q"]["small" if n <= 10 else "large"] for n in hv["n"].values])
+        lo, hi = center + bq[:, 0], center + bq[:, 1]
+        y_log = np.log(hv["per_store"].values)
+        m = _metrics(hv["per_store"], np.exp(center), np.exp(lo), np.exp(hi))
+        m["80%구간_적중률_보정전(%)"] = m.pop("80%구간_적중률(%)")
+        report["시간검증_채택_최근2분기평균"] = m
+        hist["qhat"] = _cqr_qhat(np.column_stack([lo, center, hi]), y_log)
+        size = pd.cut(hv["n"], [2, 5, 10, 30, 10 ** 6], labels=["3~5곳", "6~10곳", "11~30곳", "31곳+"])
+        ape = np.abs(np.exp(center) - hv["per_store"].values) / hv["per_store"].values
+        report["채택방식_점포수별_오차중앙값(%)"] = (pd.Series(ape).groupby(size.values, observed=True).median() * 100).round(1).to_dict()
+
+    # ③ 배포용: 최신 분기 전체로 다시 학습 (ML은 실적이 없는 상권용 보조 모델 B만)
+    final = {"B": _fit(train_Q, FEATS_B, categories)}
     report["구간보정값(로그)"] = {k: round(v, 3) for k, v in qhat.items()}
-    report["설명"] = ("모델A=지난 분기 매출까지 사용, 모델B=동네 특성만 사용. 오차_중앙값은 예측이 실제와 보통 몇 % "
+    report["채택방식_구간보정값(로그)"] = round(hist["qhat"], 3)
+    report["설명"] = ("채택=최근 2개 분기 실제 매출 평균(실제 데이터에서 가장 정확해서 채택). 모델A=ML+지난 분기 매출, "
+                    "모델B=ML+동네 특성만(같은 업종 실적이 없는 상권에만 사용). 오차_중앙값은 예측이 실제와 보통 몇 % "
                     "차이 나는지, 80%구간_적중률은 '예측 범위 안에 실제 값이 들어간 비율'(목표 80%).")
     return {
-        "created": time.time(), "Q": Q, "models": final, "qhat": qhat, "categories": categories,
+        "created": time.time(), "Q": Q, "models": final, "qhat": qhat, "categories": categories, "hist": hist,
         "frame_Q": frame_Q, "area_Q": area_Q, "report": report,
     }
 
@@ -379,53 +405,64 @@ def model_report():
 
 def predict_entrant(svc, trdar_cds):
     """
-    반환: {상권코드: {"하위10%": 만원, "중앙": 만원, "상위10%": 만원, "점포수_진입후": n+1,
-                     "사용모델": "A"|"B", "신뢰도": 설명}}
-    같은 업종이 없는 상권(n=0)도 예측하지만, 학습 범위(점포 3곳 이상) 밖이라 신뢰도가 낮다고 표시한다.
+    "이 상권에 이 업종 가게를 하나 더 열면, 점포당 월매출은?"
+    반환: {상권코드: {"하위10%", "중앙", "상위10%" (만원), "점포수_진입전", "점포수_진입후", "사용모델", "신뢰도"}}
+
+    1순위(실적 있음): 최근 2개 분기 실제 점포당 매출 평균. 범위는 실제 분기간 변동폭(검증으로 보정).
+                     내가 들어가면 같은 수요를 n+1곳이 나눠 갖는다고 보고 n/(n+1)을 곱한다 (보수적 가정).
+    2순위(실적 없음): 동네 특성 ML 모델 B. 실제 데이터 검증에서 정확도가 낮아 신뢰도 '낮음'으로 표시.
     """
     b = get_model()
     if not b:
         return None
-    fq, area, cats = b["frame_Q"], b["area_Q"], b["categories"]
-    rows = []
+    fq, area, cats, hist = b["frame_Q"], b["area_Q"], b["categories"], b.get("hist") or {}
+    out, need_ml = {}, []
     for cd in trdar_cds:
         cd = str(cd)
         hit = fq[(fq["TRDAR_CD"] == cd) & (fq["svc"] == svc)]
-        if len(hit):
-            r = hit.iloc[0].to_dict()
+        r = hit.iloc[0] if len(hit) else None
+        if r is not None and (r["per_store"] or 0) > 0 and hist.get("bucket_q"):
+            c = math.log(r["per_store"])
+            if np.isfinite(r["lag_log"]):
+                c = (c + r["lag_log"]) / 2
+            n = int(r["n"])
+            ql, qh = hist["bucket_q"]["small" if n <= 10 else "large"]
+            share = math.log(n / (n + 1))
+            lo, mid, hi = c + ql - hist["qhat"] + share, c + share, c + qh + hist["qhat"] + share
+            out[cd] = {
+                "하위10%": round(math.exp(lo)), "중앙": round(math.exp(mid)), "상위10%": round(math.exp(hi)),
+                "점포수_진입전": n, "점포수_진입후": n + 1, "사용모델": "최근 2분기 실적",
+                "신뢰도": "보통" if n >= MIN_STORES else "낮음 - 같은 업종 점포가 적어 분기마다 변동이 큼",
+            }
         else:
-            base = fq[fq["TRDAR_CD"] == cd]
-            r = {"TRDAR_CD": cd, "svc": svc, "n": 0, "FRC_STOR_CO": 0, "OPBIZ_RT": np.nan, "CLSBIZ_RT": np.nan,
-                 "amt": 0.0, "lag_log": np.nan,
-                 "total_n": float(base["n"].sum()) if len(base) else 0.0,
-                 "total_amt": float(base["amt"].sum()) if len(base) else 0.0,
-                 "n_types": float(len(base))}
-            if cd in area.index:
-                r.update(area.loc[cd].to_dict())
-        r["n_before"] = r["n"]
-        r["n"] = r["n"] + 1           # 내가 들어간 뒤의 점포 수
-        r["total_n"] = r["total_n"] + 1
-        rows.append(r)
-    if not rows:
-        return {}
-    df = add_pair_features(pd.DataFrame(rows))
-    for c in CAT_F:
-        df[c] = df[c].astype(str).where(df[c].notna())
+            need_ml.append((cd, r))
 
-    out = {}
-    has_lag = np.isfinite(pd.to_numeric(df["lag_log"], errors="coerce"))
-    for name, feats, mask in (("A", FEATS_A, has_lag), ("B", FEATS_B, ~has_lag)):
-        sub = df[mask.values]
-        if not len(sub):
-            continue
-        P = np.exp(_predict_log(b["models"][name], sub, feats, cats, b["qhat"].get(name, 0.0)))
-        for (_, r), p in zip(sub.iterrows(), P):
+    if need_ml and "B" in b["models"]:
+        rows = []
+        for cd, r in need_ml:
+            if r is not None:
+                d = r.to_dict()
+            else:
+                base = fq[fq["TRDAR_CD"] == cd]
+                d = {"TRDAR_CD": cd, "svc": svc, "n": 0, "FRC_STOR_CO": 0, "OPBIZ_RT": np.nan, "CLSBIZ_RT": np.nan,
+                     "amt": 0.0, "lag_log": np.nan, "total_n": float(base["n"].sum()) if len(base) else 0.0,
+                     "total_amt": float(base["amt"].sum()) if len(base) else 0.0, "n_types": float(len(base))}
+                if cd in area.index:
+                    d.update(area.loc[cd].to_dict())
+            d["n_before"] = d["n"]
+            d["n"] = d["n"] + 1
+            d["total_n"] = d["total_n"] + 1
+            rows.append(d)
+        df = add_pair_features(pd.DataFrame(rows))
+        for c in CAT_F:
+            df[c] = df[c].astype(str).where(df[c].notna())
+        P = np.exp(_predict_log(b["models"]["B"], df, FEATS_B, cats, b["qhat"].get("B", 0.0)))
+        for (_, r), p in zip(df.iterrows(), P):
             nb = int(r["n_before"])
             out[r["TRDAR_CD"]] = {
                 "하위10%": round(float(p[0])), "중앙": round(float(p[1])), "상위10%": round(float(p[2])),
-                "점포수_진입전": nb, "점포수_진입후": nb + 1, "사용모델": name,
-                "신뢰도": ("보통" if nb >= MIN_STORES else "낮음 - 같은 업종 점포가 " + str(MIN_STORES)
-                         + "곳 미만이라 학습 범위 밖"),
+                "점포수_진입전": nb, "점포수_진입후": nb + 1, "사용모델": "동네특성 ML(B)",
+                "신뢰도": "낮음 - 이 상권에 같은 업종 매출 실적이 없어 동네 특성만으로 추정 (검증 오차 큼)",
             }
     return out
 
@@ -436,13 +473,14 @@ def model_summary_for_user():
     if not b:
         return None
     r = b["report"]
-    t = r.get("시간검증_모델A") or {}
+    t = r.get("시간검증_채택_최근2분기평균") or {}
     s = r.get("공간검증_모델B(처음보는상권)") or {}
     return {
         "기준_분기": r.get("기준_분기"),
-        "학습_사례수": r.get("학습_사례수"),
-        "시간검증_오차중앙값(%)": t.get("오차_중앙값(%)"),
-        "처음보는상권_오차중앙값(%)": s.get("오차_중앙값(%)"),
-        "80%예측범위_적중률(%)(처음보는상권, 보정후)": s.get("80%구간_적중률(%)"),
-        "기준선(지난분기값)_오차중앙값(%)": (r.get("시간검증_기준선_지난분기값") or {}).get("오차_중앙값(%)"),
+        "검증_사례수": t.get("사례수"),
+        "예측방식": "최근 2개 분기 실제 점포당 매출 평균 (ML 모델보다 정확해서 채택)",
+        "다음분기_오차중앙값(%)": t.get("오차_중앙값(%)"),
+        "80%범위_적중률_보정전(%)": t.get("80%구간_적중률_보정전(%)"),
+        "점포수별_오차중앙값(%)": r.get("채택방식_점포수별_오차중앙값(%)"),
+        "실적없는상권_ML_오차중앙값(%)": s.get("오차_중앙값(%)"),
     }
