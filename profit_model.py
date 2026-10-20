@@ -5,7 +5,9 @@
 
 계산 순서
   1) 예상 월매출
-     - 방법 1 (주 계산): 이 상권 같은 업종의 점포당 월매출 × 층수·면적 보정
+     - 방법 0 (주 계산): sales_model.py의 학습·검증된 예측 모델. 내가 들어가 점포가 1곳 늘어난 상황의
+                          점포당 월매출 하위10%/중앙/상위10% → 보수/보통/낙관. 층수·면적 보정만 가정값.
+     - 방법 1 (모델 실패 시): 이 상권 같은 업종의 점포당 월매출 × 층수·면적 보정
                           (점포당 월매출 = 서울시 추정매출 ÷ 점포 수. 추정매출을 전체 매출로 간주)
      - 방법 2 (검산용): 하루 예상 방문객 × 객단가(결제 1건당 평균 금액) × 한 달 영업일
      - 보수(평균의 70%) / 보통(100%) /낙관(120%) 세 가지 시나리오
@@ -83,7 +85,8 @@ def size_factor(area_pyeong, svc):
 
 
 def compute_profit(svc, base_monthly_sales, avg_ticket, area_pyeong, monthly_rent, deposit=0,
-                   maintenance=None, premium=0, interior_total=None, open_days_per_month=26):
+                   maintenance=None, premium=0, interior_total=None, open_days_per_month=26,
+                   scenario_sales=None):
     """
     순수 계산 함수 (데이터 조회 없음). 금액 단위는 모두 '만원'.
     base_monthly_sales: 보정까지 끝난 '보통' 시나리오 월매출
@@ -97,7 +100,8 @@ def compute_profit(svc, base_monthly_sales, avg_ticket, area_pyeong, monthly_ren
 
     scenarios = {}
     for name, mult in SCENARIOS.items():
-        rev = base_monthly_sales * mult
+        # 예측 모델이 준 범위가 있으면 그걸 쓰고, 없으면 평균의 70%/100%/120%
+        rev = scenario_sales[name] if scenario_sales else base_monthly_sales * mult
         costs = {
             "재료비": rev * cp["재료비"],
             "인건비(사장 제외)": rev * cp["인건비"],
@@ -240,11 +244,29 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
             if not base_sales:
                 base_sales, source = visitors_check["방문객_기준_월매출_만원"], "관심고객 × 객단가 추정 (매출 데이터 없음)"
 
+    # 예측 모델: 같은 업종 점포가 하나 늘어난 상황(내가 진입)의 점포당 월매출과 80% 범위
+    scenario_sales, model_pred, scenario_meaning = None, None, "보수=평균의 70%, 보통=평균, 낙관=평균의 120% (임의 가정)"
+    try:
+        from sales_model import predict_entrant, model_summary_for_user
+        pr = (predict_entrant(svc, [trdar_cd]) or {}).get(trdar_cd)
+    except Exception as e:
+        pr, model_error = None, str(e)
+    if pr:
+        scenario_sales = {"보수": pr["하위10%"] * ff * sf, "보통": pr["중앙"] * ff * sf, "낙관": pr["상위10%"] * ff * sf}
+        base_sales = scenario_sales["보통"]
+        source = ("매출 예측 모델" + pr["사용모델"] + " (같은 업종 " + str(pr["점포수_진입전"]) + "곳 → 내가 들어가면 "
+                  + str(pr["점포수_진입후"]) + "곳 기준, 신뢰도 " + pr["신뢰도"] + ")")
+        model_pred = {"점포당_월매출_예측_만원(층·면적 보정 전)": {k: pr[k] for k in ("하위10%", "중앙", "상위10%")},
+                      "모델_검증": model_summary_for_user()}
+        scenario_meaning = "보수=예측 하위 10%, 보통=예측 중앙값, 낙관=예측 상위 10% (실제 값이 이 범위에 들어갈 확률 약 80%, 검증으로 보정)"
+
     if not base_sales:
         return {"error": "이 업종의 매출 데이터를 찾지 못해 수익을 계산할 수 없습니다.", "업종": svc}
 
     result = compute_profit(svc, base_sales, ticket, area_pyeong, monthly_rent, deposit, maintenance,
-                            premium, interior_total, open_days)
+                            premium, interior_total, open_days, scenario_sales=scenario_sales)
+    result["시나리오_의미"] = scenario_meaning
+    result["매출_예측_모델"] = model_pred
     result.update({
         "업종": svc,
         "매출_기준": source,
@@ -253,7 +275,7 @@ def predict_listing_profit(trdar_cd, business, area_pyeong, monthly_rent, deposi
             "서울_점포당_월매출_중앙값_만원": round(seoul_median) if seoul_median else None,
             "서울평균_대비_매출지수": idx,
             "동네_평균_점포_월매출_만원": round(base_raw) if base_raw else None,
-            "층수_보정": round(ff, 2), "면적_보정": round(sf, 2),
+            "층수_보정(가정값)": round(ff, 2), "면적_보정(가정값)": round(sf, 2),
             "표준평수": COST_PROFILES.get(svc, DEFAULT_COST)["표준평수"],
         },
         "검산_관심고객_기준": visitors_check,

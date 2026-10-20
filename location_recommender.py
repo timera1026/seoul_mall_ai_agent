@@ -177,6 +177,7 @@ def get_trade_area_meta():
             "상권구분": r.get("TRDAR_SE_CD_NM"),
             "자치구": gu,
             "행정동": r.get("ADSTRD_CD_NM"),
+            "면적": _num(r.get("RELM_AR")),
             "lat": round(lat, 6) if lat else None,
             "lng": round(lng, 6) if lng else None,
         }
@@ -271,7 +272,22 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         return {"error": "조건에 맞는 상권이 없습니다" + where + ". 점포가 " + str(MIN_STORES)
                          + "곳 이상인 상권만 비교하기 때문에, 범위를 넓혀 보세요.", "업종": svc}
 
-    pr_sales = _percentile_ranks([c["서울평균_대비_매출지수"] for c in candidates])
+    # 예측 모델이 있으면 '내가 들어갔을 때(점포 +1) 점포당 월매출 예측'으로 순위를 매긴다
+    model_info = None
+    try:
+        from sales_model import predict_entrant, model_summary_for_user
+        preds = predict_entrant(svc, [c["trdar_cd"] for c in candidates]) or {}
+        if preds:
+            model_info = model_summary_for_user()
+        for c in candidates:
+            p = preds.get(c["trdar_cd"])
+            if p:
+                c["진입시_예측_월매출_만원"] = {"하위10%": p["하위10%"], "중앙": p["중앙"], "상위10%": p["상위10%"]}
+    except Exception:
+        preds = {}
+    sales_key = [((c.get("진입시_예측_월매출_만원") or {}).get("중앙") if preds else c["서울평균_대비_매출지수"])
+                 for c in candidates]
+    pr_sales = _percentile_ranks(sales_key)
     pr_traffic = _percentile_ranks([c["하루_관심_유동인구"] for c in candidates])
     pr_closure = _percentile_ranks([c["폐업률"] for c in candidates])
     for c, s, t, cl in zip(candidates, pr_sales, pr_traffic, pr_closure):
@@ -293,6 +309,8 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         "비교한_상권_수": len(candidates),
         "서울_점포당_월매출_중앙값_만원": round(seoul_median) if seoul_median else None,
         "추천_상권": candidates[:top_n],
+        "매출_순위_기준": "예측 모델(내가 들어간 뒤 점포당 월매출 중앙값)" if model_info else "현재 점포당 월매출(서울 평균 대비)",
+        "예측모델_검증": model_info,
         "점수_계산법": "점포당 매출(서울 평균 대비) 45% + 관심 유동인구 30% + 낮은 폐업률 25% (각각 비교 상권 중 백분위)",
         "참고": "점포당 월매출 = 서울시 추정매출(카드결제 보정값, 전체 매출로 간주) ÷ 같은 업종 점포 수(프랜차이즈 포함). 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외",
     }

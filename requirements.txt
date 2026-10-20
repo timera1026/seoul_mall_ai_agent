@@ -5,3 +5,5 @@ streamlit
 pandas
 pyproj
 fpdf2
+numpy
+scikit-learn

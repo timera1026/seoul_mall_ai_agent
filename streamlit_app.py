@@ -33,6 +33,7 @@ from compare_trade_area import (
 )
 from location_recommender import recommend_locations
 from profit_model import predict_listing_profit
+import sales_model
 from foot_traffic import (
     analyze_foot_traffic,
     estimate_target_customers,
@@ -163,6 +164,8 @@ SYSTEM_PROMPT_FOUNDER = (
     "호출하세요. 사용자가 원하는 지역(구)을 말했으면 gu에 넣으세요. 답변은 상위 5곳 표(순위, 상권명, "
     "자치구, 점수, 점포당 월매출 추정, 서울평균 대비 지수, 점포 수, 폐업률, 하루 유동인구)와 각 상권을 추천하는 이유 한 문장을 쓰고, "
     "서울평균_대비_매출지수로 상위 상권이 서울 평균 가게보다 몇 배 버는지 짚어주세요. "
+    "추천 상권에 진입시_예측_월매출_만원이 있으면 '내가 들어갔을 때 예상 월매출 O~O만원(중앙 O만원)'도 표에 넣고, "
+    "예측모델_검증의 오차 중앙값을 한 줄로 밝히세요. "
     "점수가 높아도 점포당 매출이 높은 곳은 보통 임대료도 비싸다는 점을 한 줄로 알려주세요. "
     "결과의 error에 선택_가능한_업종 목록이 있으면 그중 가장 가까운 업종으로 다시 호출하세요. "
     "1위 상권에 대해서는 analyze_foot_traffic을 추가로 호출해 언제 사람이 많은지도 짧게 설명하면 좋습니다.\n"
@@ -171,8 +174,11 @@ SYSTEM_PROMPT_FOUNDER = (
     "모르면 비워도 됨). 답변은 ① 판정 한 줄 ② 시나리오 표(보수/보통/낙관: 월매출, 월비용, 월순이익) "
     "③ 보통 시나리오 비용 내역에서 큰 항목 3~4개 ④ 손익분기 월매출과 손익분기 하루 손님 수 "
     "⑤ 임대료_매출_비율이 15%를 넘으면 경고 ⑥ 초기투자 합계와 투자금 회수 기간 순서로 쓰세요. "
-    "매출_기준이 '상권'이 아니라 구/서울 중앙값이면 정확도가 낮다고 밝히고, 검산_관심고객_기준의 월매출이 "
-    "보통 시나리오와 2배 이상 차이 나면 그 점도 짚으세요. 순이익은 세금 전이고 사장 본인 인건비가 빠진 금액이라는 "
+    "매출_예측_모델이 있으면 시나리오는 학습·검증된 예측 범위(하위10%~상위10%)이므로 '실제 매출이 이 범위에 들어갈 "
+    "확률 약 80%'라고 설명하고, 모델_검증의 오차 중앙값(예: '이 모델은 보통 ±20% 정도 틀립니다')을 한 줄로 반드시 "
+    "밝히세요. 매출_예측_모델이 null이면 '예측 모델을 아직 쓸 수 없어 동네 평균으로 대신 계산했다'고 밝히세요. "
+    "신뢰도가 '낮음'이면 그 이유도 짚으세요. 층수·면적 보정과 비용 비율은 데이터가 아닌 가정값이라는 점도 짧게 알려주세요. "
+    "검산_관심고객_기준의 월매출이 보통 시나리오와 2배 이상 차이 나면 그 점도 짚으세요. 순이익은 세금 전이고 사장 본인 인건비가 빠진 금액이라는 "
     "점을 반드시 한 줄로 알려주세요. 사용자가 위치는 정했지만 업종을 못 정했다면 A) 흐름으로 추천 업종 2~3개를 "
     "고른 뒤 각각 predict_listing_profit을 호출해 비교표를 만들어 주세요.\n\n"
     "도구 결과 해석 원칙:\n"
@@ -916,7 +922,8 @@ def get_claude_response(client, messages):
                     st.write("💰 인근 매매가/임대료 시세 조회 중... (병렬 처리)")
                 elif tool_use.name == "predict_listing_profit":
                     st.write("📍 매물이 속한 상권 찾는 중...")
-                    st.write("📊 같은 업종 가게들의 평균 매출 불러오는 중... (처음 한 번은 30초쯤 걸려요)")
+                    st.write("📊 같은 업종 가게들의 매출 불러오는 중...")
+                    st.write("🧠 매출 예측 모델 실행 중... (앱을 처음 켰다면 학습이 끝날 때까지 2~4분 걸려요)")
                     st.write("🧮 비용·손익분기·투자금 회수 기간 계산 중...")
                 elif tool_use.name == "recommend_locations_for_business":
                     st.write("📥 서울 전체 상권의 매출·점포·유동인구 데이터 불러오는 중... (처음 한 번은 30초쯤 걸려요)")
@@ -957,6 +964,15 @@ def render_naver_map(lat, lng, title="분석 위치"):
         st.warning("지도 이미지를 불러오지 못했습니다. 원인: " + str(error))
         return
     st.image(image_bytes, caption=title, use_container_width=True)
+
+
+@st.cache_resource
+def warm_up_sales_model():
+    """앱이 켜질 때 예측 모델을 뒤에서 미리 학습시켜 둔다 (처음 질문할 때 기다리지 않도록)."""
+    import threading
+    t = threading.Thread(target=sales_model.get_model, daemon=True)
+    t.start()
+    return True
 
 
 def main():
@@ -1003,7 +1019,45 @@ def main():
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+    warm_up_sales_model()
+
     with st.sidebar:
+        with st.expander("🧠 매출 예측 모델 검증 결과"):
+            st.caption(
+                "서울 상권×업종 사례로 '가게 하나가 얼마를 버는지'를 학습한 모델이 실제로 얼마나 맞히는지 보여줍니다. "
+                "처음 켜면 학습에 2~4분 걸립니다."
+            )
+            if st.button("검증 결과 보기"):
+                with st.spinner("모델 확인 중... (아직 학습 중이면 끝날 때까지 기다립니다)"):
+                    rep = sales_model.model_report()
+                if rep.get("error"):
+                    st.error(rep["error"])
+                else:
+                    names = {
+                        "시간검증_모델A": "🧠 모델A (지난 분기 매출 포함)",
+                        "시간검증_모델B": "🧠 모델B (동네 특성만)",
+                        "시간검증_기준선_지난분기값": "📏 기준선: 지난 분기 값 그대로",
+                        "시간검증_기준선_업종중앙값": "📏 기준선: 서울 업종 중앙값",
+                        "공간검증_모델B(처음보는상권)": "🗺️ 처음 보는 상권 (모델B)",
+                    }
+                    for key, label in names.items():
+                        m = rep.get(key)
+                        if not isinstance(m, dict):
+                            continue
+                        parts = ["오차 중앙값 " + str(m.get("오차_중앙값(%)")) + "%",
+                                 "±30% 안 " + str(m.get("오차_30%이내_비율(%)")) + "%"]
+                        if "80%구간_적중률(%)" in m:
+                            parts.append("범위 적중 " + str(m["80%구간_적중률(%)"]) + "%")
+                        if "80%구간_적중률_보정전(%)" in m:
+                            parts.append("범위 적중(보정 전) " + str(m["80%구간_적중률_보정전(%)"]) + "%")
+                        st.markdown("**" + label + "**  \n" + " · ".join(parts))
+                    st.caption(rep.get("설명", ""))
+                    st.write("기준 분기:", rep.get("기준_분기"), "· 학습 사례:", rep.get("학습_사례수"))
+            if st.button("모델 다시 학습"):
+                with st.spinner("최신 데이터로 다시 학습 중... (2~4분)"):
+                    sales_model.get_model(force=True)
+                st.success("다시 학습했습니다. '검증 결과 보기'를 눌러 확인하세요.")
+
         with st.expander("🔧 데이터 점검 (개발용)"):
             st.caption("새로 연결한 서울시 API들이 실제로 데이터를 주는지, 필드 이름이 무엇인지 확인합니다.")
             if st.button("점검 실행"):
