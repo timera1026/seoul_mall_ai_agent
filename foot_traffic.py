@@ -566,4 +566,23 @@ def inspect_new_apis():
     y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
     rows, total, msg = _seoul_get("CardSubwayTime", 1, 1, "{:04d}{:02d}".format(y, m))
     report["CardSubwayTime"] = {"결과": msg, "전체건수": total, "필드": list(rows[0].keys()) if rows else []}
+
+    # 매출 단위 확인: 카페 한 곳의 보통 월매출은 1,000~2,000만원 수준.
+    # '월 환산' 값이 이 근처면 SALES_AMT_MONTHS 설정(3)이 맞는 것이다.
+    try:
+        from location_recommender import recommend_locations
+        from compare_trade_area import CONFIG
+        rec = recommend_locations("커피-음료", top_n=1)
+        median = rec.get("업종_점포당_월_추정매출_중앙값_만원")
+        if median is not None:
+            report["매출단위_점검_카페"] = {
+                "점포당_원본값_중앙값_만원": median * CONFIG["SALES_AMT_MONTHS"],
+                "점포당_월환산_중앙값_만원": median,
+                "현재_나누는_값": CONFIG["SALES_AMT_MONTHS"],
+                "비교한_상권_수": rec.get("비교한_상권_수"),
+            }
+        else:
+            report["매출단위_점검_카페"] = rec.get("error")
+    except Exception as e:
+        report["매출단위_점검_카페"] = "확인 실패: " + str(e)
     return report

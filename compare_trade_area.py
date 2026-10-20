@@ -62,6 +62,11 @@ CONFIG = {
 
     # 업소 분포를 조회할 기본 반경(m)
     "DEFAULT_RADIUS_M": 500,
+
+    # 서울시 추정매출(THSMON_SELNG_AMT)은 이름은 '당월'이지만 분기(3개월) 단위로 집계된
+    # 값이다. 월 매출로 쓰려면 이 숫자로 나눈다. (예전 데이터셋 이름이 '분기당_매출_금액')
+    # 만약 실제로 월 단위로 확인되면 1로 바꾸면 된다. (사이드바 '데이터 점검'에서 확인 가능)
+    "SALES_AMT_MONTHS": 3,
 }
 
 # 서울시 25개 자치구 법정동코드(5자리) 매핑표.
@@ -1621,7 +1626,7 @@ def estimate_rent(base_price_per_pyeong, area_pyeong, pop_summary, store_breakdo
     # 표기가 다를 수 있어 category_name 원문으로 부분일치 매칭을 시도한다.
     sales_summary = summarize_estimated_sales(estimated_sales_rows, category_name) if estimated_sales_rows else None
     if sales_summary and sales_summary.get("당월_추정매출_원"):
-        monthly_sales_manwon = sales_summary["당월_추정매출_원"] / 10000
+        monthly_sales_manwon = sales_summary["당월_추정매출_원"] / CONFIG["SALES_AMT_MONTHS"] / 10000
         rent_to_sales_ratio = None
         if monthly_sales_manwon > 0:
             rent_to_sales_ratio = round((adjusted_monthly_rent / monthly_sales_manwon) * 100, 1)

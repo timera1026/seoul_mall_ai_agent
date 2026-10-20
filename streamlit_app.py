@@ -32,6 +32,7 @@ from compare_trade_area import (
     CONFIG,
 )
 from location_recommender import recommend_locations
+from profit_model import predict_listing_profit
 from foot_traffic import (
     analyze_foot_traffic,
     estimate_target_customers,
@@ -161,13 +162,19 @@ SYSTEM_PROMPT_FOUNDER = (
     "B) '카페 하고 싶은데 어디가 좋을까?' 같은 업종 기반 질문: recommend_locations_for_business를 "
     "호출하세요. 사용자가 원하는 지역(구)을 말했으면 gu에 넣으세요. 답변은 상위 5곳 표(순위, 상권명, "
     "자치구, 점수, 점포당 추정매출, 점포 수, 폐업률, 하루 유동인구)와 각 상권을 추천하는 이유 한 문장, "
-    "그리고 업종_점포당_추정매출_중앙값과 비교해 상위 상권이 얼마나 더 버는지 짚어주세요. "
+    "그리고 업종_점포당_월_추정매출_중앙값과 비교해 상위 상권이 얼마나 더 버는지 짚어주세요. "
     "점수가 높아도 점포당 매출이 높은 곳은 보통 임대료도 비싸다는 점을 한 줄로 알려주세요. "
     "결과의 error에 선택_가능한_업종 목록이 있으면 그중 가장 가까운 업종으로 다시 호출하세요. "
     "1위 상권에 대해서는 analyze_foot_traffic을 추가로 호출해 언제 사람이 많은지도 짧게 설명하면 좋습니다.\n"
-    "C) 특정 매물(보증금, 월세, 평수)을 주며 수익을 묻는 질문: 아직 정식 수익 계산 기능은 준비 중입니다. "
-    "estimate_shop_rent와 estimate_target_customers 결과로 대략적인 매출 대비 임대료 부담만 알려주고, "
-    "'정밀 수익 예측은 곧 추가될 예정'이라고 한 줄로 안내하세요.\n\n"
+    "C) 특정 매물(보증금, 월세, 평수 등)을 주며 '얼마나 남을까?'를 묻는 질문: predict_listing_profit을 "
+    "호출하세요. 업종이나 월세·평수 중 빠진 게 있으면 추측하지 말고 먼저 짧게 물어보세요(보증금·관리비·권리금·층은 "
+    "모르면 비워도 됨). 답변은 ① 판정 한 줄 ② 시나리오 표(보수/보통/낙관: 월매출, 월비용, 월순이익) "
+    "③ 보통 시나리오 비용 내역에서 큰 항목 3~4개 ④ 손익분기 월매출과 손익분기 하루 손님 수 "
+    "⑤ 임대료_매출_비율이 15%를 넘으면 경고 ⑥ 초기투자 합계와 투자금 회수 기간 순서로 쓰세요. "
+    "매출_기준이 '상권'이 아니라 구/서울 중앙값이면 정확도가 낮다고 밝히고, 검산_관심고객_기준의 월매출이 "
+    "보통 시나리오와 2배 이상 차이 나면 그 점도 짚으세요. 순이익은 세금 전이고 사장 본인 인건비가 빠진 금액이라는 "
+    "점을 반드시 한 줄로 알려주세요. 사용자가 위치는 정했지만 업종을 못 정했다면 A) 흐름으로 추천 업종 2~3개를 "
+    "고른 뒤 각각 predict_listing_profit을 호출해 비교표를 만들어 주세요.\n\n"
     "도구 결과 해석 원칙:\n"
     "- estimate_target_customers 결과는 '하루 관심고객 약 O명, 하루 예상 방문객 O~O명(전환율 1~4% 가정)'처럼 "
     "반드시 숫자로 말하세요.\n"
@@ -338,6 +345,34 @@ TOOLS.append({
 })
 
 
+TOOLS.append({
+    "name": "predict_listing_profit",
+    "description": (
+        "실제 상가 매물(위치, 평수, 월세, 보증금 등)에서 특정 업종을 할 때 한 달에 얼마가 남을지 예측한다. "
+        "같은 상권의 같은 업종 점포 평균 매출을 층수·면적으로 보정해 보수/보통/낙관 3가지 월매출을 만들고, "
+        "업종별 비용 구조(재료비·인건비·공과금·배달·카드수수료)와 월세·관리비를 빼서 월 순이익, "
+        "손익분기 매출, 손익분기 하루 손님 수, 초기투자와 회수 기간을 계산한다. 금액 단위는 모두 만원."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "keyword": {"type": "string", "description": "매물 근처 상권 키워드 (예: '망원역')"},
+            "address": {"type": "string", "description": "매물 주소 또는 지오코딩용 주소"},
+            "business": {"type": "string", "description": "하려는 업종 (예: '카페', '치킨')"},
+            "area_pyeong": {"type": "number", "description": "전용면적(평). ㎡로 받으면 3.3으로 나눠서 넣는다"},
+            "monthly_rent_manwon": {"type": "number", "description": "월세(만원)"},
+            "deposit_manwon": {"type": "number", "description": "보증금(만원), 모르면 0"},
+            "maintenance_manwon": {"type": "number", "description": "월 관리비(만원). 모르면 생략 (평당 1만원으로 가정)"},
+            "premium_manwon": {"type": "number", "description": "권리금(만원), 없으면 0"},
+            "floor": {"type": "integer", "description": "층 (1층=1, 2층=2, 지하1층=-1). 모르면 1"},
+            "interior_manwon": {"type": "number", "description": "인테리어·설비 예산(만원). 모르면 생략 (업종 평균으로 추정)"},
+            "open_days_per_week": {"type": "number", "description": "주 영업일 수. 모르면 6"},
+        },
+        "required": ["keyword", "address", "business", "area_pyeong", "monthly_rent_manwon"],
+    },
+})
+
+
 def resolve_trade_area(keyword, address):
     """키워드/주소 -> (상권코드, 상권명, 좌표). analyze_single_area보다 가벼운 버전."""
     geo = None
@@ -416,6 +451,26 @@ def run_tool(tool_name, tool_input):
 
     if tool_name == "analyze_building":
         return get_building_info(tool_input["address"])
+
+    if tool_name == "predict_listing_profit":
+        primary, geo = resolve_trade_area(tool_input.get("keyword"), tool_input.get("address"))
+        if not primary:
+            return {"error": "매물 위치의 상권을 찾지 못했습니다: " + str(tool_input.get("keyword"))}
+        result = predict_listing_profit(
+            primary["trdar_cd"],
+            tool_input["business"],
+            area_pyeong=tool_input["area_pyeong"],
+            monthly_rent=tool_input["monthly_rent_manwon"],
+            deposit=tool_input.get("deposit_manwon") or 0,
+            maintenance=tool_input.get("maintenance_manwon"),
+            premium=tool_input.get("premium_manwon") or 0,
+            floor=tool_input.get("floor") or 1,
+            interior_total=tool_input.get("interior_manwon"),
+            open_days_per_week=tool_input.get("open_days_per_week") or 6,
+        )
+        result["상권명"] = primary.get("trdar_cd_nm")
+        result["geo"] = geo
+        return result
 
     if tool_name == "recommend_locations_for_business":
         return recommend_locations(
@@ -541,12 +596,24 @@ def build_charts_from_tool_call(tool_name, result):
                     "type": "line",
                 })
 
+    if tool_name == "predict_listing_profit" and result.get("시나리오"):
+        label = (result.get("상권명") or "") + " " + (result.get("업종") or "")
+        charts.append({
+            "title": label + " - 시나리오별 월 순이익(만원)",
+            "data": {k: v["월순이익_만원"] for k, v in result["시나리오"].items()},
+        })
+        costs = result["시나리오"]["보통"]["비용_내역_만원"]
+        charts.append({
+            "title": label + " - 보통 시나리오 월 비용 내역(만원)",
+            "data": dict(sorted(costs.items(), key=lambda kv: kv[1], reverse=True)),
+        })
+
     if tool_name == "recommend_locations_for_business":
         top = (result.get("추천_상권") or [])[:7]
         if top:
             charts.append({
-                "title": (result.get("업종") or "") + " - 추천 상권 점포당 추정매출(만원)",
-                "data": {str(i + 1) + ". " + str(c["상권명"]): c["점포당_추정매출_만원"] for i, c in enumerate(top)},
+                "title": (result.get("업종") or "") + " - 추천 상권 점포당 월 추정매출(만원)",
+                "data": {str(i + 1) + ". " + str(c["상권명"]): c["점포당_월_추정매출_만원"] for i, c in enumerate(top)},
             })
 
     if tool_name == "analyze_foot_traffic":
@@ -796,6 +863,8 @@ def describe_tool_call(tool_name, tool_input):
         return "🔍 '" + tool_input.get("keyword", "") + "' 상권 분석 중"
     if tool_name == "estimate_shop_rent":
         return "💰 '" + tool_input.get("keyword", "") + "' 임대료 계산 중"
+    if tool_name == "predict_listing_profit":
+        return "💵 '" + tool_input.get("keyword", "") + "' 매물 수익 계산 중"
     if tool_name == "recommend_locations_for_business":
         return "🗺️ '" + tool_input.get("business", "") + "' 하기 좋은 상권 찾는 중"
     if tool_name == "analyze_foot_traffic":
@@ -845,6 +914,10 @@ def get_claude_response(client, messages):
                     st.write("📍 위치(좌표) 확인 중...")
                     st.write("📊 유동인구 · 업종 데이터 조회 중... (병렬 처리)")
                     st.write("💰 인근 매매가/임대료 시세 조회 중... (병렬 처리)")
+                elif tool_use.name == "predict_listing_profit":
+                    st.write("📍 매물이 속한 상권 찾는 중...")
+                    st.write("📊 같은 업종 가게들의 평균 매출 불러오는 중... (처음 한 번은 30초쯤 걸려요)")
+                    st.write("🧮 비용·손익분기·투자금 회수 기간 계산 중...")
                 elif tool_use.name == "recommend_locations_for_business":
                     st.write("📥 서울 전체 상권의 매출·점포·유동인구 데이터 불러오는 중... (처음 한 번은 30초쯤 걸려요)")
                     st.write("🧮 점포당 매출 · 관심 유동인구 · 폐업률로 순위 매기는 중...")
@@ -936,6 +1009,35 @@ def main():
             if st.button("점검 실행"):
                 with st.spinner("API 확인 중..."):
                     st.json(inspect_new_apis())
+
+        if is_founder:
+            st.header("🏠 매물 수익 계산기")
+            st.caption("보고 있는 매물 정보를 넣으면 한 달에 얼마 남을지 계산해 드려요.")
+            with st.form("listing_form"):
+                f_addr = st.text_input("매물 위치 (역 이름이나 주소)", placeholder="예: 망원역, 서울 마포구 망원동 123")
+                f_biz = st.text_input("하려는 업종", placeholder="예: 카페, 치킨, 미용실")
+                c1, c2 = st.columns(2)
+                f_area = c1.number_input("전용면적(평)", min_value=1.0, value=15.0, step=1.0)
+                f_floor = c2.selectbox("층", ["1층", "2층", "3층 이상", "지하"])
+                f_deposit = c1.number_input("보증금(만원)", min_value=0, value=3000, step=500)
+                f_rent = c2.number_input("월세(만원)", min_value=0, value=200, step=10)
+                f_maint = c1.number_input("관리비(만원, 모르면 0)", min_value=0, value=0, step=5)
+                f_premium = c2.number_input("권리금(만원)", min_value=0, value=0, step=500)
+                submitted = st.form_submit_button("💵 수익 계산하기", use_container_width=True)
+            if submitted:
+                if not f_addr or not f_biz:
+                    st.warning("매물 위치와 업종을 입력해 주세요.")
+                else:
+                    floor_txt = {"1층": "1층", "2층": "2층", "3층 이상": "3층", "지하": "지하1층"}[f_floor]
+                    q = (
+                        f_addr + "에 있는 매물에서 " + f_biz + "를 하면 한 달에 얼마나 남을까? "
+                        + "전용 " + str(f_area) + "평, " + floor_txt + ", 보증금 " + str(f_deposit) + "만원, "
+                        + "월세 " + str(f_rent) + "만원"
+                        + (", 관리비 " + str(f_maint) + "만원" if f_maint else ", 관리비는 몰라")
+                        + (", 권리금 " + str(f_premium) + "만원" if f_premium else ", 권리금 없음")
+                    )
+                    st.session_state.pending_question = q
+                    st.rerun()
 
         if not is_founder:
             st.header("📐 도면 기반 호실별 분석")
@@ -1067,6 +1169,8 @@ def main():
             "카페를 하고 싶은데 서울에서 어디가 좋을까?",
             "마포구에서 20~30대 여성 대상 네일숍 하기 좋은 곳 추천해줘",
             "청량리역에 치킨집 열면 하루 손님 몇 명쯤 올까?",
+            "망원역 1층 15평, 보증금 3천에 월세 250인 자리에서 카페 하면 얼마 남을까?",
+            "성수역 근처 20평 2층 월세 300 매물, 어떤 업종이 제일 많이 남을까?",
         ]
         cols = st.columns(2)
         for i, q in enumerate(examples):
@@ -1110,7 +1214,7 @@ def main():
                     top = (record["result"].get("추천_상권") or [None])[0]
                     if top and top.get("lat") and top.get("lng") and not map_info:
                         map_info = {"lat": top["lat"], "lng": top["lng"], "title": "추천 1위: " + str(top["상권명"])}
-                if record["name"] in ("analyze_trade_area", "analyze_foot_traffic", "estimate_target_customers"):
+                if record["name"] in ("analyze_trade_area", "analyze_foot_traffic", "estimate_target_customers", "predict_listing_profit"):
                     geo = record["result"].get("geo")
                     if geo and geo.get("lat") and geo.get("lng"):
                         map_info = {

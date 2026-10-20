@@ -18,7 +18,7 @@
 """
 
 from foot_traffic import load_quarter_table, find_latest_quarter, previous_quarter
-from compare_trade_area import summarize_population, compute_demand_score, SEOUL_GU_LAWD_CD
+from compare_trade_area import summarize_population, compute_demand_score, SEOUL_GU_LAWD_CD, CONFIG
 
 WEIGHTS = {"sales": 0.45, "traffic": 0.30, "survival": 0.25}
 MIN_STORES = 3  # 점포가 이보다 적은 상권은 평균이 불안정해서 순위에서 뺀다
@@ -178,6 +178,8 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
             continue
 
         amt = _num(r.get("THSMON_SELNG_AMT"))
+        if amt:
+            amt = amt / CONFIG["SALES_AMT_MONTHS"]  # 분기 합계 -> 월 매출
         st = store_by_cd.get(cd) or {}
         n_store = _num(st.get("STOR_CO")) or _num(st.get("SIMILR_INDUTY_STOR_CO"))
         if not amt or not n_store or n_store < MIN_STORES:
@@ -204,8 +206,8 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
             "lat": info.get("lat"), "lng": info.get("lng"),
             "점포수": int(n_store),
             "프랜차이즈_점포수": int(_num(st.get("FRC_STOR_CO")) or 0),
-            "점포당_추정매출_만원": round(amt / n_store / 10000),
-            "업종_전체_추정매출_만원": round(amt / 10000),
+            "점포당_월_추정매출_만원": round(amt / n_store / 10000),
+            "업종_전체_월_추정매출_만원": round(amt / 10000),
             "폐업률": _num(st.get("CLSBIZ_RT")),
             "개업률": _num(st.get("OPBIZ_RT")),
             "하루_유동인구": round(daily) if daily else None,
@@ -217,7 +219,7 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         return {"error": "조건에 맞는 상권이 없습니다" + where + ". 점포가 " + str(MIN_STORES)
                          + "곳 이상인 상권만 비교하기 때문에, 범위를 넓혀 보세요.", "업종": svc}
 
-    pr_sales = _percentile_ranks([c["점포당_추정매출_만원"] for c in candidates])
+    pr_sales = _percentile_ranks([c["점포당_월_추정매출_만원"] for c in candidates])
     pr_traffic = _percentile_ranks([c["하루_관심_유동인구"] for c in candidates])
     pr_closure = _percentile_ranks([c["폐업률"] for c in candidates])
     for c, s, t, cl in zip(candidates, pr_sales, pr_traffic, pr_closure):
@@ -229,7 +231,7 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         }
 
     candidates.sort(key=lambda c: c["점수"], reverse=True)
-    per_store = sorted(c["점포당_추정매출_만원"] for c in candidates)
+    per_store = sorted(c["점포당_월_추정매출_만원"] for c in candidates)
     median = per_store[len(per_store) // 2]
 
     return {
@@ -239,7 +241,7 @@ def recommend_locations(business, gu=None, top_n=10, target_ages=None):
         "매출_기준_분기": sales_q,
         "유동인구_기준_분기": flpop_q,
         "비교한_상권_수": len(candidates),
-        "업종_점포당_추정매출_중앙값_만원": median,
+        "업종_점포당_월_추정매출_중앙값_만원": median,
         "추천_상권": candidates[:top_n],
         "점수_계산법": "점포당 추정매출 45% + 관심 유동인구 30% + 낮은 폐업률 25% (각각 비교 상권 중 백분위)",
         "참고": "추정매출은 카드매출 기반 추정치이며, 점포 " + str(MIN_STORES) + "곳 미만 상권은 제외함",
