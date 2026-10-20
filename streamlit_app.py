@@ -11,7 +11,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 from dotenv import load_dotenv
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError
 
 load_dotenv()
 
@@ -969,9 +969,20 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("생각 중..."):
-                final_text, updated_messages, tool_call_records = get_claude_response(
-                    client, st.session_state.api_messages
-                )
+                try:
+                    final_text, updated_messages, tool_call_records = get_claude_response(
+                        client, st.session_state.api_messages
+                    )
+                except AuthenticationError:
+                    # 실패한 질문은 대화 기록에서 빼야 다음 질문이 정상 동작한다
+                    st.session_state.api_messages.pop()
+                    st.session_state.display_messages.pop()
+                    st.error(
+                        "Claude API 키가 맞지 않거나 만료되었습니다. "
+                        "console.anthropic.com에서 새 키를 만든 뒤, Streamlit Cloud의 "
+                        "Settings → Secrets에 있는 ANTHROPIC_API_KEY 값을 바꿔주세요."
+                    )
+                    st.stop()
             st.markdown(fix_markdown_tables(final_text))
 
             all_charts = []
